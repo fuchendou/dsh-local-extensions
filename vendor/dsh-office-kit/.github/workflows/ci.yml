@@ -1,0 +1,50 @@
+name: Unit Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  unit-test:
+    uses: sxzz/workflows/.github/workflows/unit-test.yml@main
+
+  # The reusable workflow above has no Python runtime, so the pack-script
+  # integration tests skip there. This job provisions the dependencies the
+  # skills promise and runs them on every platform the kit supports: native
+  # engines on macOS and Windows, the WASM engine on Linux.
+  integration:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CJK fonts
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fonts-wqy-zenhei
+      - run: python -m pip install --disable-pip-version-check -r python/requirements.txt
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm vitest run test/office-cli.test.ts
+        env:
+          DSH_OFFICE_PYTHON: python
+          DSH_OFFICE_REQUIRE_RENDERER: '1'
+
+  # coverage:
+  #   uses: sxzz/workflows/.github/workflows/coverage.yml@main
+  #   needs: unit-test
+  #   permissions:
+  #     id-token: write
