@@ -7,3 +7,5 @@
 **/.env
 **/.env.*
 **/.credentials.yaml
+
+**/node_modules
