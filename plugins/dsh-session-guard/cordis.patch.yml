@@ -1,0 +1,7 @@
+- id: sandbox
+  disabled: true
+- insert:
+    - id: channel-history-sandbox
+      name: dsh-session-guard/sandbox
+    - id: channel-session-guard
+      name: dsh-session-guard
