@@ -1,0 +1,54 @@
+{
+  "name": "dsh-channels",
+  "version": "0.5.2-personalai.1",
+  "private": true,
+  "description": "Connect WeChat, QQ, DingTalk, Lark and Telegram to DeepSeek Harness — unified config, QR-code auth, chat with your Agent from IM",
+  "type": "module",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "packageManager": "pnpm@9.15.3",
+  "pnpm": {
+    "overrides": {
+      "@deepseek-ai/dsh-sandbox": "0.2.1-rc.5",
+      "@deepseek-ai/cordis": "~4.0.5",
+      "@deepseek-ai/schemastery": "~3.18.5",
+      "@deepseek-ai/cordis-plugin-include": "~1.0.10"
+    }
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "ci:check": "node scripts/ci-local.mjs",
+    "test:run": "vitest run",
+    "check:fixtures": "pnpm --filter @wsz987/channel-compat run check:fixtures",
+    "check:manifests": "pnpm --filter @wsz987/channel-compat run check:manifests",
+    "doctor": "pnpm --filter @wsz987/channel-compat run doctor",
+    "verify": "pnpm --filter @wsz987/channel-verify run verify",
+    "channels": "node scripts/dev-channels.mjs",
+    "channels:clean": "node scripts/dev-channels.mjs --clean",
+    "web:debug": "node scripts/dev-web-debug.mjs",
+    "web:kill": "kill-port 3080",
+    "check:upstream": "node scripts/check-upstream.mjs",
+    "check:harness-compat": "node scripts/check-upstream.mjs --harness-compat",
+    "check:harness-newer": "node scripts/check-upstream.mjs --harness-newer",
+    "check:bundle": "pnpm --filter @wsz987/dsh-channels run test",
+    "clean": "turbo run clean",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "changeset publish",
+    "test:release": "node --test scripts/release-scripts.test.mjs",
+    "release:verify": "node scripts/release-verify.mjs",
+    "release:pack": "node scripts/release-pack.mjs",
+    "release:publish": "node scripts/release-publish.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0",
+    "@types/node": "^22.0.0",
+    "kill-port": "2.0.1",
+    "turbo": "^2.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

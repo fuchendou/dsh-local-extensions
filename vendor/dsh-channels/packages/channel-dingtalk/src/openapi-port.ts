@@ -1,0 +1,209 @@
+/**
+ * DingTalkOpenApiPort — the thin official DingTalk OpenAPI port.
+ *
+ * Two layers make up the DingTalk adapter:
+ *
+ *   DingTalkStreamPort      -> dingtalk-stream SDK (own module: stream-upstream.ts)
+ *   DingTalkOpenApiPort     -> official DingTalk OpenAPI (this port)
+ *
+ * This port is deliberately SMALL. It is the outbound counterpart to
+ * the stream callbacks: everything that is an HTTP call back into DingTalk
+ * (access token, proactive robot messages, media upload/send, AI Card
+ * create/update/finish, opaque-mediaId resolution) lives here.
+ *
+ * Behavior oracle: the official connector
+ * `@dingtalk-real-ai/dingtalk-connector@0.8.24`. Its npm exports are only
+ * `.` and `./bundled` and its root entry depends on OpenClaw, so the package
+ * cannot be used as a host-neutral SDK today. Therefore THIS adapter
+ * re-implements the thin OpenAPI calls itself — mirroring the connector's
+ * token / HTTP patterns — and records the corresponding official-behavior basis
+ * on every method (`DingTalkOpenApiPortImpl.OFFICIAL_BASIS`). If the connector
+ * later exposes host-neutral `./media` / `./messaging` / `./openapi`
+ * subpaths, the internal implementation is swapped out without touching the
+ * adapter.
+ *
+ * No second DingTalk SDK is introduced. The port never
+ * hand-writes a Stream websocket protocol — that is dingtalk-stream's job.
+ */
+import type { ChannelTarget } from '@wsz987/channel-core';
+
+/**
+ * Capability flags the harness outbox reads to decide whether proactive sends
+ * are available. Fails CLOSED: a feature is only `true` when its
+ * official OAPI path is actually implemented and wired by the adapter.
+ */
+export interface OutboxCapabilities {
+  /** Proactive plain-text send to a conversationId via the official OAPI. */
+  proactiveText: boolean;
+  /** Proactive media (image/file) send via official upload + media send. */
+  proactiveMedia: boolean;
+}
+
+/** Result of `getAccessToken`. Kept intentionally minimal. */
+export interface AccessTokenResult {
+  accessToken: string;
+  expireInMs: number;
+}
+
+/** Credentials + optional clock used to mint the application access token. */
+export interface DingTalkOpenApiCredentials {
+  clientId?: string;
+  clientSecret?: string;
+  /** Injectable clock for token-expiry caching (tests). */
+  now?: () => number;
+}
+
+/** Target of a proactive robot message. */
+export interface ProactiveTextInput {
+  /** Robot's open conversation id (group) or, for a DM, the recipient userId. */
+  conversationId: string;
+  /** The robot code (usually the AppKey). */
+  robotCode: string;
+  /** Plain text to send. */
+  text: string;
+  /** `'group'` uses robot groupMessages/send; `'dm'` uses oToMessages/batchSend. */
+  conversationType?: 'dm' | 'group';
+}
+
+/** Payload to upload a media file via the official robot file-upload endpoint. */
+export interface MediaUploadInput {
+  /** Robot code (usually the AppKey). */
+  robotCode: string;
+  /** File name used to carry the correct content type and display name. */
+  fileName: string;
+  /** MIME type of the uploaded bytes (used as the request content type). */
+  mimeType?: string;
+  /** The raw bytes of the file to upload. */
+  data: Uint8Array;
+  /** DingTalk OAPI upload category. */
+  mediaType: 'image' | 'file';
+  /** Target conversation, when the platform requires an agentId/space for upload. */
+  target?: ChannelTarget;
+}
+
+/** Result of a successful media upload: a DingTalk `mediaId`. */
+export interface MediaUploadResult {
+  mediaId: string;
+}
+
+/** Send an already-uploaded media id as a robot image/file message. */
+export interface MediaSendInput {
+  /** Robot's open conversation id (group) or, for a DM, the recipient userId. */
+  conversationId: string;
+  /** The robot code (usually the AppKey). */
+  robotCode: string;
+  /** The `mediaId` returned by `uploadMedia`. */
+  mediaId: string;
+  /** `image` -> `sampleImageMsg`; `file` -> `sampleFile`. */
+  msgtype: 'image' | 'file';
+  /** Display file name for the file-message path. */
+  name?: string;
+  /** `'group'` -> robot groupMessages/send; `'dm'` -> oToMessages/batchSend. */
+  conversationType?: 'dm' | 'group';
+}
+
+/** Result of any proactive / media robot message send. */
+export interface RobotMessageSendResult {
+  /** The platform message id when reported. */
+  messageId?: string;
+  /** Raw platform response for diagnostics. */
+  raw?: unknown;
+}
+
+/** One opaque-platform-handle resolution: locator -> trusted bytes. */
+export interface ResolvedMedia {
+  /** Trusted bytes already downloaded by the platform upstream. */
+  data: Uint8Array;
+  /** MIME type hint, when the platform reports one. */
+  mimeType?: string;
+  /** Byte size, when known. */
+  size?: number;
+}
+
+/** The thin official DingTalk OpenAPI port. */
+export interface DingTalkOpenApiPort {
+  /** Mint (and cache) the application access token. */
+  getAccessToken(): Promise<string>;
+
+  /** Send a proactive plain-text message to a conversation. */
+  sendProactiveText(input: ProactiveTextInput): Promise<RobotMessageSendResult>;
+
+  /** Upload a media file, returning the DingTalk mediaId. */
+  uploadMedia(input: MediaUploadInput): Promise<MediaUploadResult>;
+
+  /** Send an uploaded mediaId as a robot image/file message. */
+  sendMedia(input: MediaSendInput): Promise<RobotMessageSendResult>;
+
+  sendInteractiveCard(input: {
+    target: ChannelTarget;
+    templateId: string;
+    text: string;
+    actions: import('@wsz987/channel-core').OutboundActionRow[];
+    textParam: string;
+    actionsParam: string;
+  }): Promise<{ messageId?: string; outTrackId: string; raw?: unknown }>;
+
+  updateInteractiveCard(input: {
+    outTrackId: string;
+    text: string;
+    actions: import('@wsz987/channel-core').OutboundActionRow[];
+    textParam: string;
+    actionsParam: string;
+  }): Promise<unknown>;
+
+  /** Create an AI Card with initial content. */
+  createCard(target: ChannelTarget, text: string): Promise<{ cardId: string }>;
+
+  /** Update an AI Card's body text. */
+  updateCard(cardId: string, text: string): Promise<unknown>;
+
+  /** Finalize an AI Card. */
+  finishCard(cardId: string, text?: string): Promise<unknown>;
+
+  /**
+   * Resolve an opaque platform handle (a DingTalk mediaId / downloadCode) into
+   * trusted bytes. Official behavior basis: the connector's
+   * `downloadMediaByCode` / `getFileDownloadUrl` — POST
+   * `/v1.0/robot/messageFiles/download` with `{ downloadCode, robotCode }`
+   * returns a `downloadUrl`, which is then fetched as raw bytes. A genuine
+   * http(s) `ref` is fetched directly. Throws a typed error when the ref is
+   * opaque and no `downloadCode` context is available (fail closed, no
+   * invented download protocol).
+   */
+  resolveMedia(
+    ref: string,
+    options?: {
+      signal?: AbortSignal;
+      name?: string;
+      /** Per-message download code from the inbound callback (official schema). */
+      downloadCode?: string;
+      /** Robot code (AppKey); required for the official download API. */
+      robotCode?: string;
+    },
+  ): Promise<ResolvedMedia>;
+
+  /**
+   * Resolve an opaque platform handle into a download URL, when the platform
+   * can hand one back. Optional refinement of `resolveMedia`.
+   */
+  getMediaDownloadUrl?(
+    ref: string,
+    options?: { signal?: AbortSignal; downloadCode?: string; robotCode?: string },
+  ): Promise<string | undefined>;
+}
+
+/** A minimal, injectable subset of the port used by inbound hydration. */
+export interface MediaResolverLike {
+  /** Resolve one opaque media handle into trusted bytes. */
+  resolveMedia(
+    ref: string,
+    options?: {
+      signal?: AbortSignal;
+      name?: string;
+      /** Per-message download code from the inbound callback (official schema). */
+      downloadCode?: string;
+      /** Robot code (AppKey); required for the official download API. */
+      robotCode?: string;
+    },
+  ): Promise<ResolvedMedia>;
+}

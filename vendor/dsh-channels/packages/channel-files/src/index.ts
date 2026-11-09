@@ -1,0 +1,11 @@
+export * from './attachments/index.js';
+export * from './attachment-resolver.js';
+export * from './paths.js';
+export * from './service.js';
+export * from './catalog/types.js';
+export * from './catalog/store.js';
+export * from './catalog/legacy-backfill.js';
+export * from './backends/harness-native.js';
+export * from './migration/verify.js';
+export * from './migration/migrate-on-read.js';
+export { name, apply } from './plugin.js';

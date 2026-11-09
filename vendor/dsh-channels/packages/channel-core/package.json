@@ -1,0 +1,48 @@
+{
+  "name": "@wsz987/channel-core",
+  "version": "0.5.2-personalai.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wsz987/dsh-channels.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Stable cross-channel contract and Cordis ChannelService for DeepSeek Harness Channels",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./plugin": {
+      "types": "./lib/plugin.d.ts",
+      "default": "./lib/plugin.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "clean": "rimraf lib"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-home-paths": "0.2.1-rc.5",
+    "@deepseek-ai/schemastery": "~3.18.5",
+    "mime-types": "3.0.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/mime-types": "3.0.1",
+    "rimraf": "^6.0.0",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10"
+  },
+  "license": "MIT"
+}

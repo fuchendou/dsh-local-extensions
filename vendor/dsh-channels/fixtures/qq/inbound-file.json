@@ -1,0 +1,49 @@
+{
+  "name": "inbound c2c file message",
+  "channel": "qq",
+  "upstreamVersion": "1.0.4",
+  "payload": {
+    "rawEventType": "C2C_MESSAGE_CREATE",
+    "kind": "c2c",
+    "senderId": "user_123",
+    "senderName": "alice",
+    "senderIsBot": false,
+    "content": "",
+    "messageId": "msg_file_1",
+    "timestamp": "2026-08-14T10:00:00+08:00",
+    "attachments": [
+      { "content_type": "file", "url": "https://example.com/report.pdf", "filename": "report.pdf", "size": 4096 }
+    ],
+    "replyTarget": { "scope": "c2c", "targetId": "user_123", "msgId": "msg_file_1" },
+    "raw": {
+      "id": "msg_file_1",
+      "content": "",
+      "timestamp": "2026-08-14T10:00:00+08:00",
+      "author": { "user_openid": "user_123" },
+      "attachments": [
+        { "content_type": "file", "url": "https://example.com/report.pdf", "filename": "report.pdf", "size": 4096 }
+      ]
+    }
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "qq",
+    "accountId": "main",
+    "conversation": { "id": "user_123", "type": "dm" },
+    "sender": { "id": "user_123", "name": "alice" },
+    "message": {
+      "id": "msg_file_1",
+      "content": [{ "type": "file", "url": "https://example.com/report.pdf", "name": "report.pdf", "size": 4096 }],
+      "createdAt": 1786672800000
+    },
+    "raw": {
+      "id": "msg_file_1",
+      "content": "",
+      "timestamp": "2026-08-14T10:00:00+08:00",
+      "author": { "user_openid": "user_123" },
+      "attachments": [
+        { "content_type": "file", "url": "https://example.com/report.pdf", "filename": "report.pdf", "size": 4096 }
+      ]
+    }
+  }
+}

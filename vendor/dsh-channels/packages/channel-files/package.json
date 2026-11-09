@@ -1,0 +1,62 @@
+{
+  "name": "@wsz987/channel-files",
+  "version": "0.5.2-personalai.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wsz987/dsh-channels.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Optional generic file storage and document extraction for dsh-channels",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "clean": "rimraf lib"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-atomic-write": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-home-paths": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.5",
+    "@wsz987/channel-core": "workspace:*",
+    "@wsz987/channel-harness": "workspace:*",
+    "mammoth": "1.12.1",
+    "unpdf": "1.8.1",
+    "xlsx": "0.18.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-session-projection": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-timeout": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-user-approval": "0.2.1-rc.5",
+    "rimraf": "^6.0.0",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10",
+    "@deepseek-ai/dsh-fs": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-sandbox": "0.2.1-rc.5"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

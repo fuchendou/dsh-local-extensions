@@ -1,0 +1,629 @@
+/**
+ * dsh-channels host API v2 control-plane routes (M4-M5 host side).
+ *
+ * Lives on `/dsh-channels/api/v2` and delegates every operation to the
+ * ChannelControlService (doc §28–§33). This is deliberately a THIN layer:
+ *
+ * ```text
+ * HTTP → validate (strict schema) → ChannelControlLike → serialize public DTO
+ * ```
+ *
+ * The web layer never knows credential ref names: setup descriptors carry
+ * credential fields, and `saveCredential` maps a field name to its ref
+ * server-side (doc §31). Secret values are never echoed — the credential PUT
+ * returns only `{ configured, writable }`.
+ *
+ * The service is injected as a structural seam ([ChannelControlLike]) so this
+ * package ships no hard dependency on the concrete control-plane plugin; when
+ * the seam is absent (standalone web profile) the caller registers a 503 stub
+ * instead.
+ */
+import type {
+  AuthBeginInput,
+  AuthInput,
+  BundleUpdateStatus,
+  ChannelAccessState,
+  ChannelSetupDescriptor,
+  ChannelSetupInput,
+  ChannelSetupResult,
+  ChannelSummary,
+  ConfiguredState,
+  PublicAuthSession,
+  PublicAuthStatus,
+  PublicConversationIdentity,
+  PublicOwnerClaimSession,
+} from '@wsz987/channel-control';
+import type { ChannelAccessPolicy } from '@wsz987/channel-core';
+import { channelAccessPolicySchema, isChannelError } from '@wsz987/channel-core';
+import { isControlError } from '@wsz987/channel-control';
+import { z } from 'zod';
+import { errorBody } from './security.js';
+
+/** Minimal structural view of the ChannelControlService surface we consume. */
+export interface ChannelControlLike {
+  listChannels(): Promise<ChannelSummary[]>;
+  getSetup(channelId: string): Promise<ChannelSetupDescriptor>;
+  getConfiguredState(channelId: string): Promise<ConfiguredState>;
+  setEnabled(channelId: string, enabled: boolean): Promise<ChannelSummary>;
+  saveConfig(channelId: string, patch: Record<string, unknown>): Promise<void>;
+  describeCredential(
+    channelId: string,
+    field: string,
+  ): Promise<{ configured: boolean; writable: boolean; source?: string }>;
+  saveCredential(
+    channelId: string,
+    field: string,
+    value: string,
+  ): Promise<{ configured: boolean; writable: boolean }>;
+  applySetup(channelId: string, input: ChannelSetupInput): Promise<ChannelSetupResult>;
+  beginAuth(channelId: string, input: AuthBeginInput): Promise<PublicAuthSession>;
+  pollAuth(sessionId: string): Promise<PublicAuthStatus>;
+  submitAuthInput(sessionId: string, input: AuthInput): Promise<PublicAuthStatus>;
+  cancelAuth(sessionId: string): Promise<void>;
+  // ---- access control ------------------------------------------
+  getAccess(channelId: string, accountId?: string): Promise<ChannelAccessState>;
+  saveAccess(
+    channelId: string,
+    policy: ChannelAccessPolicy,
+    accountId?: string,
+  ): Promise<ChannelAccessState>;
+  beginOwnerClaim(channelId: string, accountId?: string): Promise<PublicOwnerClaimSession>;
+  getOwnerClaim(channelId: string, claimId: string): Promise<PublicOwnerClaimSession>;
+  confirmOwnerClaim(channelId: string, claimId: string): Promise<ChannelAccessState>;
+  cancelOwnerClaim(channelId: string, claimId: string): Promise<void>;
+  // ---- conversation identity directory (display/mapping only) --------------
+  listConversations(channelId: string, accountId?: string): Promise<PublicConversationIdentity[]>;
+  findConversation(
+    channelId: string,
+    externalId: string,
+    accountId?: string,
+  ): Promise<PublicConversationIdentity | undefined>;
+  // ---- bundle update check (prompt-only, read-only DTO) --------------------
+  getUpdateStatus(): Promise<BundleUpdateStatus>;
+}
+
+export interface ApiResultV2 {
+  status: number;
+  body: unknown;
+}
+
+const AUTH_METHODS = ['qr', 'device', 'portal-login', 'credentials', 'hybrid'] as const;
+
+/** URL-decode safety: decodeURIComponent of malformed escapes is a URIError. */
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/** Any JSON object (never an array / null / primitive). */
+const jsonObjectSchema = z.object({}).loose();
+
+/** Non-empty string check shared by path params. */
+const nonEmptyString = z.string().min(1);
+
+/** A 400 INVALID_INPUT result for a malformed body/path value. */
+function badInput(message: string): { ok: false; result: ApiResultV2 } {
+  return { ok: false, result: { status: 400, body: errorBody('INVALID_INPUT', message) } };
+}
+
+/** Validate that a value is a non-empty string, or a 400 result. */
+function requireString(
+  value: unknown,
+  field: string,
+): { ok: true; value: string } | { ok: false; result: ApiResultV2 } {
+  const parsed = nonEmptyString.safeParse(value);
+  if (!parsed.success) return badInput(field + ' must be a non-empty string');
+  return { ok: true, value: parsed.data };
+}
+
+/**
+ * Map a control-plane error to an HTTP status + structured body. Unknown
+ * channels surface as 404; expired sessions as 410; every other recognized
+ * control code gets 400; anything unexpected becomes a redacted 500.
+ */
+function mapControlError(error: unknown): ApiResultV2 {
+  if (isControlError(error)) {
+    switch (error.code) {
+      case 'CONTROL_DEFINITION_NOT_FOUND':
+      case 'UNKNOWN_FIELD':
+      case 'AUTH_SESSION_NOT_FOUND':
+      case 'AUTH_SESSION_CANCELLED':
+      case 'CLAIM_NOT_FOUND':
+        return { status: 404, body: errorBody(error.code, error.message) };
+      case 'AUTH_SESSION_EXPIRED':
+      case 'CLAIM_EXPIRED':
+        return { status: 410, body: errorBody(error.code, error.message) };
+      case 'SECRET_FIELD_REJECTED':
+      case 'NOT_A_SECRET_FIELD':
+      case 'INVALID_CREDENTIAL':
+      case 'CREDENTIAL_READONLY':
+      case 'CREDENTIAL_NOT_SUPPORTED':
+      case 'AUTH_NOT_SUPPORTED':
+      case 'AUTH_NOT_READY':
+      case 'ENABLE_NOT_SUPPORTED':
+      case 'INVALID_ACCESS_POLICY':
+      case 'CLAIM_CANCELLED':
+      case 'CLAIM_NOT_SUPPORTED':
+      case 'CLAIM_INVALID':
+        return { status: 400, body: errorBody(error.code, error.message) };
+      default:
+        return {
+          status: 500,
+          body: errorBody('CONTROL_ERROR', 'channel control failed'),
+        };
+    }
+  }
+  if (isChannelError(error)) {
+    // The only ChannelError the control surface raises here is an unknown
+    // channel ("definition not registered"); map it to 404.
+    return {
+      status: 404,
+      body: errorBody('CONTROL_DEFINITION_NOT_FOUND', 'unknown channel'),
+    };
+  }
+  // Never leak an arbitrary message.
+  return { status: 500, body: errorBody('INTERNAL_ERROR', 'internal error') };
+}
+
+/** Run `fn` and translate any control-plane throw into an ApiResult. */
+async function run<T>(
+  fn: () => Promise<T> | T,
+  ok: (value: T) => { status: number; body: unknown },
+): Promise<ApiResultV2> {
+  try {
+    const value = await fn();
+    return ok(value);
+  } catch (error) {
+    return mapControlError(error);
+  }
+}
+
+export class ChannelApiV2 {
+  constructor(private readonly control: ChannelControlLike) {}
+
+  /**
+   * Resolve whether a channel id exists (via the setup descriptor). Returns a
+   * 404 result for unknown channels so every channel-scoped endpoint reports a
+   * stable code.
+   */
+  private async channelOr404(
+    channelId: string,
+  ): Promise<{ ok: true } | { ok: false; result: ApiResultV2 }> {
+    try {
+      await this.control.getSetup(channelId);
+      return { ok: true };
+    } catch (error) {
+      if (isControlError(error, 'CONTROL_DEFINITION_NOT_FOUND') || isChannelError(error)) {
+        return {
+          ok: false,
+          result: { status: 404, body: errorBody('CHANNEL_NOT_FOUND', 'unknown channel: ' + channelId) },
+        };
+      }
+      throw error;
+    }
+  }
+
+  /** GET /channels → { channels: ChannelSummary[] } (doc §29). */
+  async listChannels(): Promise<ApiResultV2> {
+    return run(
+      (): Promise<ChannelSummary[]> => this.control.listChannels(),
+      (channels) => ({ status: 200, body: { channels } }),
+    );
+  }
+
+  /**
+   * GET /update-check → BundleUpdateStatus. Panel-level read-only DTO (no
+   * secrets); the host performs the registry check so the browser never
+   * contacts npm itself.
+   */
+  async getUpdateCheck(): Promise<ApiResultV2> {
+    return run(
+      () => this.control.getUpdateStatus(),
+      (status) => ({ status: 200, body: status }),
+    );
+  }
+
+  /** GET /channels/:channelId/setup → ChannelSetupDescriptor (doc §29). */
+  async getSetup(channelId: string): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    return run(() => this.control.getSetup(channelId), (setup) => ({ status: 200, body: setup }));
+  }
+
+  /**
+   * PUT /channels/:channelId/enabled → ChannelSummary (doc §23).
+   * Body: `{ enabled: boolean }`. The control plane persists the intent and
+   * starts/stops the runtime accordingly.
+   */
+  async setEnabled(channelId: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const parsed = enabledPatchSchema.safeParse(body);
+    if (!parsed.success) return badInput('enabled must be a boolean').result;
+    return run(() => this.control.setEnabled(channelId, parsed.data.enabled), (summary) => ({
+      status: 200,
+      body: summary,
+    }));
+  }
+
+  /** PUT /channels/:channelId/setup → save the whole form and reconcile. */
+  async applySetup(channelId: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const input = this.setupInput(body);
+    if (!input.ok) return input.result;
+    return run(() => this.control.applySetup(channelId, input.value), (result) => ({
+      status: 200,
+      body: result,
+    }));
+  }
+
+  /** PATCH /channels/:channelId/config → { configured, fields } (doc §30). */
+  async saveConfig(channelId: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const patch = this.configPatch(body);
+    if (!patch.ok) return patch.result;
+    const direct = async (): Promise<ConfiguredState> => {
+      await this.control.saveConfig(channelId, patch.value);
+      return this.control.getConfiguredState(channelId);
+    };
+    return run(direct, (state) => ({
+      status: 200,
+      body: { configured: state.configured, fields: state.fields },
+    }));
+  }
+
+  /** PUT /channels/:channelId/credentials/:field → { configured, writable } (doc §31). */
+  async saveCredential(channelId: string, field: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const value = this.credentialValue(body);
+    if (!value.ok) return value.result;
+    return run(() => this.control.saveCredential(channelId, field, value.value), (result) => ({
+      status: 200,
+      body: { configured: result.configured, writable: result.writable },
+    }));
+  }
+
+  /** POST /channels/:channelId/auth/sessions → 201 PublicAuthSession (doc §32). */
+  async beginAuth(channelId: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const begin = this.authBeginInput(body);
+    if (!begin.ok) return begin.result;
+    return run(() => this.control.beginAuth(channelId, begin.value), (session) => ({
+      status: 201,
+      body: session,
+    }));
+  }
+
+  /** GET /channels/:channelId/auth/sessions/:sessionId → PublicAuthStatus (doc §32). */
+  async pollAuth(channelId: string, sessionId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const sid = requireString(sessionId, 'sessionId');
+    if (!sid.ok) return sid.result;
+    return run(() => this.control.pollAuth(sid.value), (status) => ({ status: 200, body: status }));
+  }
+
+  /** POST /channels/:channelId/auth/sessions/:sessionId/input → PublicAuthStatus (doc §32). */
+  async submitInput(channelId: string, sessionId: unknown, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const sid = requireString(sessionId, 'sessionId');
+    if (!sid.ok) return sid.result;
+    const input = this.authInput(body);
+    if (!input.ok) return input.result;
+    return run(() => this.control.submitAuthInput(sid.value, input.value), (status) => ({
+      status: 200,
+      body: status,
+    }));
+  }
+
+  /** DELETE /channels/:channelId/auth/sessions/:sessionId → 204 (doc §32). */
+  async cancelAuth(channelId: string, sessionId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const sid = requireString(sessionId, 'sessionId');
+    if (!sid.ok) return sid.result;
+    return run(() => this.control.cancelAuth(sid.value), () => ({ status: 204, body: undefined }));
+  }
+
+  /** GET /channels/:channelId/access → ChannelAccessState. */
+  async getAccess(channelId: string): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    return run(() => this.control.getAccess(channelId), (state) => ({ status: 200, body: state }));
+  }
+
+  /**
+   * PUT /channels/:channelId/access → ChannelAccessState.
+   * Body is a strict ChannelAccessPolicy; malformed input is a 400 INVALID_INPUT
+   * before it reaches the control plane.
+   */
+  async saveAccess(channelId: string, body: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const parsed = accessPolicySchema.safeParse(body);
+    if (!parsed.success) return badInput(accessPolicyMessage(parsed.error)).result;
+    return run(() => this.control.saveAccess(channelId, parsed.data), (state) => ({
+      status: 200,
+      body: state,
+    }));
+  }
+
+  /** POST /channels/:channelId/access/owner-claims → 201 PublicOwnerClaimSession. */
+  async beginOwnerClaim(channelId: string): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    return run(() => this.control.beginOwnerClaim(channelId), (session) => ({
+      status: 201,
+      body: session,
+    }));
+  }
+
+  /** GET /channels/:channelId/access/owner-claims/:claimId → PublicOwnerClaimSession. */
+  async getOwnerClaim(channelId: string, claimId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const cid = requireString(claimId, 'claimId');
+    if (!cid.ok) return cid.result;
+    return run(() => this.control.getOwnerClaim(channelId, cid.value), (session) => ({
+      status: 200,
+      body: session,
+    }));
+  }
+
+  /** POST /channels/:channelId/access/owner-claims/:claimId/confirm → ChannelAccessState. */
+  async confirmOwnerClaim(channelId: string, claimId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const cid = requireString(claimId, 'claimId');
+    if (!cid.ok) return cid.result;
+    return run(() => this.control.confirmOwnerClaim(channelId, cid.value), (state) => ({
+      status: 200,
+      body: state,
+    }));
+  }
+
+  /** DELETE /channels/:channelId/access/owner-claims/:claimId → 204. */
+  async cancelOwnerClaim(channelId: string, claimId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const cid = requireString(claimId, 'claimId');
+    if (!cid.ok) return cid.result;
+    return run(() => this.control.cancelOwnerClaim(channelId, cid.value), () => ({
+      status: 204,
+      body: undefined,
+    }));
+  }
+
+  /**
+   * GET /channels/:channelId/conversations → { conversations } — observed
+   * conversation identities (plan §35). Display/mapping metadata only.
+   */
+  async listConversations(channelId: string): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    return run(() => this.control.listConversations(channelId), (conversations) => ({
+      status: 200,
+      body: { conversations },
+    }));
+  }
+
+  /**
+   * GET /channels/:channelId/conversations/by-external/:externalId → the one
+   * observed identity matching an optional human-facing id, or 404 when
+   * the bot has never seen it. Callers must not guess a canonical id.
+   */
+  async findConversation(channelId: string, externalId: unknown): Promise<ApiResultV2> {
+    const found = await this.channelOr404(channelId);
+    if (!found.ok) return found.result;
+    const eid = requireString(externalId, 'externalId');
+    if (!eid.ok) return eid.result;
+    return run(() => this.control.findConversation(channelId, eid.value), (identity) =>
+      identity
+        ? { status: 200, body: identity }
+        : { status: 404, body: errorBody('CONVERSATION_NOT_FOUND', 'no observed conversation for that external id') },
+    );
+  }
+
+  /**
+   * Match a path under `/dsh-channels/api/v2` (the prefix is stripped by the
+   * caller) and dispatch. Returns 404 for unknown routes.
+   */
+  async handle(method: string, pathname: string, body: unknown): Promise<ApiResultV2> {
+    const clean = pathname.replace(/\/+$/, '');
+    if (method === 'GET' && clean === '/channels') return this.listChannels();
+    if (method === 'GET' && clean === '/update-check') return this.getUpdateCheck();
+
+    const setup = /^\/channels\/([^/]+)\/setup$/.exec(clean);
+    if (method === 'GET' && setup) return this.getSetup(safeDecode(setup[1]!));
+    if (method === 'PUT' && setup) return this.applySetup(safeDecode(setup[1]!), body);
+
+    const enabled = /^\/channels\/([^/]+)\/enabled$/.exec(clean);
+    if (method === 'PUT' && enabled) return this.setEnabled(safeDecode(enabled[1]!), body);
+
+    const config = /^\/channels\/([^/]+)\/config$/.exec(clean);
+    if (method === 'PATCH' && config) return this.saveConfig(safeDecode(config[1]!), body);
+
+    const credential = /^\/channels\/([^/]+)\/credentials\/([^/]+)$/.exec(clean);
+    if (method === 'PUT' && credential) {
+      return this.saveCredential(safeDecode(credential[1]!), safeDecode(credential[2]!), body);
+    }
+
+    const begin = /^\/channels\/([^/]+)\/auth\/sessions$/.exec(clean);
+    if (method === 'POST' && begin) return this.beginAuth(safeDecode(begin[1]!), body);
+
+    const session = /^\/channels\/([^/]+)\/auth\/sessions\/([^/]+)$/.exec(clean);
+    if (session) {
+      if (method === 'GET') return this.pollAuth(safeDecode(session[1]!), safeDecode(session[2]!));
+      if (method === 'DELETE') return this.cancelAuth(safeDecode(session[1]!), safeDecode(session[2]!));
+    }
+
+    const input = /^\/channels\/([^/]+)\/auth\/sessions\/([^/]+)\/input$/.exec(clean);
+    if (method === 'POST' && input) {
+      return this.submitInput(safeDecode(input[1]!), safeDecode(input[2]!), body);
+    }
+
+    // ---- access control ---------------------------------------
+    const access = /^\/channels\/([^/]+)\/access$/.exec(clean);
+    if (access) {
+      const id = safeDecode(access[1]!);
+      if (method === 'GET') return this.getAccess(id);
+      if (method === 'PUT') return this.saveAccess(id, body);
+    }
+
+    const beginClaim = /^\/channels\/([^/]+)\/access\/owner-claims$/.exec(clean);
+    if (method === 'POST' && beginClaim) return this.beginOwnerClaim(safeDecode(beginClaim[1]!));
+
+    const claimConfirm = /^\/channels\/([^/]+)\/access\/owner-claims\/([^/]+)\/confirm$/.exec(clean);
+    if (method === 'POST' && claimConfirm) {
+      return this.confirmOwnerClaim(safeDecode(claimConfirm[1]!), safeDecode(claimConfirm[2]!));
+    }
+
+    const claim = /^\/channels\/([^/]+)\/access\/owner-claims\/([^/]+)$/.exec(clean);
+    if (claim) {
+      const id = safeDecode(claim[1]!);
+      const claimId = safeDecode(claim[2]!);
+      if (method === 'GET') return this.getOwnerClaim(id, claimId);
+      if (method === 'DELETE') return this.cancelOwnerClaim(id, claimId);
+    }
+
+    // ---- conversation identity directory ----------------------
+    const conversations = /^\/channels\/([^/]+)\/conversations$/.exec(clean);
+    if (method === 'GET' && conversations) {
+      return this.listConversations(safeDecode(conversations[1]!));
+    }
+
+    const byExternal = /^\/channels\/([^/]+)\/conversations\/by-external\/(.+)$/.exec(clean);
+    if (method === 'GET' && byExternal) {
+      return this.findConversation(safeDecode(byExternal[1]!), safeDecode(byExternal[2]!));
+    }
+
+    return { status: 404, body: errorBody('NOT_FOUND', 'no such endpoint') };
+  }
+
+  // ---- strict body schema validation -------------------------------------
+
+  /** PATCH config body: a flat JSON object (never nested). */
+  private configPatch(value: unknown): { ok: true; value: Record<string, unknown> } | { ok: false; result: ApiResultV2 } {
+    const parsed = jsonObjectSchema.safeParse(value);
+    if (!parsed.success) return badInput('config patch must be a JSON object');
+    return { ok: true, value: parsed.data };
+  }
+
+  /** PUT credentials body: `{ value: string }` (empty string clears). */
+  private credentialValue(body: unknown): { ok: true; value: string } | { ok: false; result: ApiResultV2 } {
+    const parsed = credentialValueSchema.safeParse(body);
+    if (!parsed.success) return badInput('value must be a string (empty clears it)');
+    return { ok: true, value: parsed.data.value };
+  }
+
+  /** PUT setup body: `{ config: object, credentials: Record<string,string> }`. */
+  private setupInput(body: unknown): { ok: true; value: ChannelSetupInput } | { ok: false; result: ApiResultV2 } {
+    const root = jsonObjectSchema.safeParse(body);
+    if (!root.success) return badInput('setup must be a JSON object');
+    // Legacy tolerance: an absent or null config/credentials section means `{}`.
+    const record = root.data;
+    const config = record.config ?? {};
+    const credentials = record.credentials ?? {};
+    const reconcile = record.reconcile;
+
+    const parsedConfig = jsonObjectSchema.safeParse(config);
+    if (!parsedConfig.success) {
+      return badInput('config and credentials must be JSON objects');
+    }
+    const parsedCredentials = credentialsRecordSchema.safeParse(credentials);
+    if (!parsedCredentials.success) {
+      const first = parsedCredentials.error.issues[0];
+      if (first && first.path.length === 1) {
+        return badInput(`credential ${String(first.path[0])} must be a string (empty clears it)`);
+      }
+      return badInput('config and credentials must be JSON objects');
+    }
+    if (reconcile !== undefined && typeof reconcile !== 'boolean') {
+      return badInput('reconcile must be a boolean when present');
+    }
+    return { ok: true, value: { config: parsedConfig.data, credentials: parsedCredentials.data, reconcile } };
+  }
+
+  /** POST auth/sessions body: `{ method: AuthMethod, accountId?: string }`. */
+  private authBeginInput(body: unknown): { ok: true; value: AuthBeginInput } | { ok: false; result: ApiResultV2 } {
+    const parsed = authBeginSchema.safeParse(body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      const message =
+        first?.path[0] === 'accountId'
+          ? 'accountId must be a non-empty string when present'
+          : 'method must be one of ' + AUTH_METHODS.join(', ');
+      return badInput(message);
+    }
+    return { ok: true, value: parsed.data };
+  }
+
+  /** POST session/input body: `{ kind: 'verification-code', value: string }`. */
+  private authInput(body: unknown): { ok: true; value: AuthInput } | { ok: false; result: ApiResultV2 } {
+    const parsed = authInputSchema.safeParse(body);
+    if (!parsed.success) {
+      const first = parsed.error.issues[0];
+      const message =
+        first?.path[0] === 'value' ? 'value must be a non-empty string' : 'kind must be "verification-code"';
+      return badInput(message);
+    }
+    return { ok: true, value: parsed.data };
+  }
+
+}
+
+/**
+ * POST session/input body: `{ kind: 'verification-code', value: string }`.
+ * Shared with the v1 routes so both API generations check the same shape.
+ */
+export const authInputSchema = z.object({
+  kind: z.literal('verification-code'),
+  value: z.string().min(1),
+}, 'kind must be "verification-code"').loose();
+
+/** PUT credentials body: `{ value: string }`. An empty string clears the credential. */
+const credentialValueSchema = z.object({
+  value: z.string(),
+}, 'value must be a string').loose();
+
+/** setup `credentials`: map of field name → value (empty string clears the credential). */
+const credentialsRecordSchema = z.record(z.string(), z.string().trim());
+
+/** POST auth/sessions body: `{ method: AuthMethod, accountId?: string }`. */
+const authBeginSchema = z.object({
+  method: z.enum(AUTH_METHODS),
+  accountId: z.string().min(1).optional(),
+}, 'method must be one of ' + AUTH_METHODS.join(', ')).loose();
+
+/** PUT channels/:id/enabled body: `{ enabled: boolean }`. */
+const enabledPatchSchema = z.object({
+  enabled: z.boolean(),
+}, 'enabled must be a boolean').loose();
+
+// ---------------------------------------------------------------------------
+// Access control body schema
+// ---------------------------------------------------------------------------
+
+/**
+ * PUT /channels/:id/access reuses the shared strict policy schema so every
+ * process boundary accepts exactly the same policy versions and semantics.
+ * The parsed value is passed to `control.saveAccess`, which re-validates it
+ * against the channel's declared descriptor (mentions/groups/DM capability).
+ */
+const accessPolicySchema = channelAccessPolicySchema;
+
+/** Human-friendly message for the first zod issue of an access policy body. */
+function accessPolicyMessage(err: z.ZodError): string {
+  const first = err.issues[0];
+  if (!first) return 'invalid access policy';
+  const at = first.path.length > 0 ? ` (${first.path.join('.')})` : '';
+  return `invalid access policy${at}: ${first.message}`;
+}

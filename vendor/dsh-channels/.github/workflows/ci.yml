@@ -1,0 +1,137 @@
+# Compatibility governance: CI gate for every pull request, every push to
+# `main`, every release tag (`v*`), and manual dispatch.
+#
+# `pull_request` (and `push` to `main`) ensures dependency PRs (e.g. from
+# Renovate) are gated by build / typecheck / tests before merge, closing the
+# loop on dependency upgrades.
+#
+# CI matrix design:
+#
+#   "harness pinned-current"    This workflow against the COMMITTED pnpm-lock.yaml
+#                               (`pnpm install --frozen-lockfile`). Proves the pinned
+#                               dependency set stays green: build, typecheck, the full
+#                               offline test suite, and the governance checks.
+#
+#   "harness latest-compatible" Run this workflow manually (workflow_dispatch) against
+#                               an updated lockfile (e.g. after a Renovate dep PR is
+#                               merged, or before a release) — the frozen install
+#                               exercises the proposed versions. All jobs must be green
+#                               before maintainers bump the manifest `testedVersion`
+#                               (governance gate below).
+#
+# Upgrade gate: new dependency -> PR -> build / typecheck /
+# contract tests / fixtures / adapter tests / Harness compat / E2E all pass ->
+# update `manifest.testedVersion`. The scheduled upgrade.yml drift check raises the
+# signal, Renovate (renovate.json) proposes the PRs, this workflow is the gate.
+#
+# Range strategy note: renovate.json uses `rangeStrategy: "bump"` so Renovate rewrites
+# the declared range to the resolved version instead of keeping a static one —
+# the committed manifest `testedVersion` must mirror what the lockfile actually pins.
+# Harness family note: `@deepseek-ai/dsh-*` compatibility is anchored to
+# HARNESS_TESTED_VERSION in scripts/check-upstream.mjs (exact pins, tested
+# compatibility band — plan §15/§16), NOT to the npm `latest` dist-tag; the
+# weekly upgrade.yml also runs the non-blocking `pnpm check:harness-newer`
+# report for versions published above the baseline.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.3
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
+      - name: Typecheck
+        run: pnpm typecheck
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.3
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # The bundle tests resolve the package's own exports map and Web client
+      # artifact. `lib/` is gitignored, and Turbo only builds dependencies of
+      # a task by default, so build the bundle graph before running tests.
+      - name: Build bundle (for bundle tests)
+        run: pnpm build --filter=@wsz987/dsh-channels...
+      - name: Test
+        run: pnpm test
+      # The verify CLI validates each target adapter's RELEASE artifact
+      # (`exports["."].default` = lib/index.js) — the exact entry a published
+      # npm package would load. `turbo run test` only builds each package's
+      # workspace dependencies (`^build`), not the packages themselves, so the
+      # verify CLI and BOTH verify targets must be built explicitly first;
+      # otherwise the declared lib/ entry is missing and the verify fails with
+      # adapter-build-missing.
+      - name: Build verify CLI and verification targets
+        run: |
+          pnpm build --filter=@wsz987/channel-verify...
+          pnpm build --filter=@wsz987/channel-telegram...
+          pnpm build --filter=@wsz987/channel-weixin...
+      # Verify the Telegram extensibility proof and an
+      # official adapter with the channel-verify CLI.
+      - name: Verify Telegram adapter (extensibility proof)
+        run: pnpm verify ./packages/channel-telegram --test
+      - name: Verify Weixin adapter (verify CLI on an official adapter)
+        run: pnpm verify ./packages/channel-weixin --test
+
+  governance:
+    name: Governance (fixtures / manifests / doctor)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.3
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      # Bundle validation needs the built packages
+      # (lib/ is gitignored), so build the bundle's dependency graph first.
+      - name: Build (for bundle validation)
+        run: pnpm build --filter=@wsz987/dsh-channels...
+      - name: Compatibility governance
+        run: pnpm check:fixtures && pnpm check:manifests && pnpm doctor && pnpm check:bundle

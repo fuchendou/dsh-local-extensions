@@ -1,0 +1,159 @@
+# Weixin Live Platform Gate.
+#
+# Split from Offline CI (ci.yml): the live gate exercises the REAL Weixin iLink
+# platform, so it must NEVER run on ordinary PRs / pushes. It is
+# workflow_dispatch-ONLY — see the R6 live-test separation rule (live tests never
+# run on ordinary PRs).
+#
+# Credential model: Weixin iLink auth is QR-login based. There are no pre-seeded
+# bot tokens. The suite writes the QR into a temporary local file and never puts
+# its payload in logs or artifacts, so this workflow must use a protected local
+# self-hosted runner with the `weixin-live` label. A GitHub-hosted runner cannot
+# present an interactive QR without leaking it through remote output.
+#
+# The workflow is a STRICT preflight: it validates every gate input BEFORE the
+# first Weixin request, so a missing/blank value fails fast with an actionable
+# message instead of surfacing mid-test as a fuzzy 401/timeout.
+
+name: Weixin Live Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_commit:
+        description: 'Tencent/openclaw-weixin commit SHA this gate verifies against (40-hex)'
+        required: true
+      upstream_version:
+        description: 'Exact package version declared by the supplied Tencent commit'
+        required: true
+      base_url:
+        description: 'iLink API base URL (blank = production default)'
+        required: false
+      image_path:
+        description: 'Absolute JPEG/PNG path on the self-hosted runner'
+        required: true
+      file_path:
+        description: 'Absolute test-file path on the self-hosted runner'
+        required: true
+      video_path:
+        description: 'Absolute MP4 path on the self-hosted runner'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-gate:
+    name: Weixin live E2E
+    runs-on: [self-hosted, linux, weixin-live]
+    environment: weixin-live
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.3
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.2
+          cache: pnpm
+
+      - name: Preflight — validate live gate inputs
+        env:
+          WEIXIN_LIVE_ENABLED: ${{ secrets.WEIXIN_LIVE_ENABLED }}
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+          BASE_URL: ${{ inputs.base_url }}
+          IMAGE_PATH: ${{ inputs.image_path }}
+          FILE_PATH: ${{ inputs.file_path }}
+          VIDEO_PATH: ${{ inputs.video_path }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+
+          if [ "${WEIXIN_LIVE_ENABLED}" != "true" ]; then
+            fail "WEIXIN_LIVE_ENABLED is not 'true'. Set the repository secret WEIXIN_LIVE_ENABLED=true before running this gate."
+          fi
+
+          if [ -z "${UPSTREAM_COMMIT}" ]; then
+            fail "workflow input 'upstream_commit' is required — the Tencent/openclaw-weixin commit SHA being verified."
+          fi
+          if ! printf '%s' "${UPSTREAM_COMMIT}" | grep -Eq '^[0-9a-fA-F]{40}$'; then
+            fail "workflow input 'upstream_commit' must be a 40-hex Git SHA (got: ${UPSTREAM_COMMIT})."
+          fi
+
+          if [ -z "${UPSTREAM_VERSION}" ]; then
+            fail "workflow input 'upstream_version' is required — the upstream version/tag being verified."
+          fi
+          if ! printf '%s' "${UPSTREAM_VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$'; then
+            fail "workflow input 'upstream_version' must be an exact package version (for example 2.4.6)."
+          fi
+
+          if [ -n "${BASE_URL}" ] && ! printf '%s' "${BASE_URL}" | grep -Eq '^https://[^[:space:]]+$'; then
+            fail "workflow input 'base_url' must be blank or an https URL."
+          fi
+
+          for path_name in IMAGE_PATH FILE_PATH VIDEO_PATH; do
+            eval "path_value=\${${path_name}}"
+            if [ -z "${path_value}" ] || [ ! -r "${path_value}" ] || [ ! -f "${path_value}" ]; then
+              fail "${path_name} must name a readable file on the self-hosted runner."
+            fi
+          done
+
+          TARGET="${BASE_URL:-https://ilinkai.weixin.qq.com}"
+          echo "Preflight OK:"
+          echo "  - live gate armed (WEIXIN_LIVE_ENABLED=true)"
+          echo "  - upstream_commit = ${UPSTREAM_COMMIT}"
+          echo "  - upstream_version = ${UPSTREAM_VERSION}"
+          echo "  - test target      = ${TARGET}"
+          echo "NOTE: the live E2E opens a temporary QR file locally on this runner. Its payload is never printed or uploaded."
+
+      - name: Verify Tencent upstream commit and package version
+        env:
+          UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+          UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+        run: |
+          set -eu
+          UPSTREAM_DIR="$(mktemp -d "${RUNNER_TEMP}/weixin-upstream-XXXXXX")"
+          cleanup() {
+            case "${UPSTREAM_DIR}" in
+              "${RUNNER_TEMP}"/weixin-upstream-*) rm -rf -- "${UPSTREAM_DIR}" ;;
+            esac
+          }
+          trap cleanup EXIT
+          git -C "${UPSTREAM_DIR}" init --quiet
+          git -C "${UPSTREAM_DIR}" fetch --quiet --depth=1 https://github.com/Tencent/openclaw-weixin.git "${UPSTREAM_COMMIT}"
+          git -C "${UPSTREAM_DIR}" checkout --quiet --detach FETCH_HEAD
+          ACTUAL_COMMIT="$(git -C "${UPSTREAM_DIR}" rev-parse HEAD)"
+          ACTUAL_VERSION="$(node -p "require(process.argv[1]).version" "${UPSTREAM_DIR}/package.json")"
+          if [ "${ACTUAL_COMMIT}" != "$(printf '%s' "${UPSTREAM_COMMIT}" | tr 'A-F' 'a-f')" ]; then
+            echo "::error::Fetched Tencent commit ${ACTUAL_COMMIT}, expected ${UPSTREAM_COMMIT}."
+            exit 1
+          fi
+          if [ "${ACTUAL_VERSION}" != "${UPSTREAM_VERSION}" ]; then
+            echo "::error::Tencent commit ${ACTUAL_COMMIT} declares package version ${ACTUAL_VERSION}, not ${UPSTREAM_VERSION}."
+            exit 1
+          fi
+          echo "Verified Tencent/openclaw-weixin ${ACTUAL_VERSION}@${ACTUAL_COMMIT}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        run: pnpm build
+
+      - name: Weixin live E2E
+        env:
+          DSH_WEIXIN_LIVE: '1'
+          DSH_WEIXIN_BASE_URL: ${{ inputs.base_url }}
+          DSH_WEIXIN_UPSTREAM_COMMIT: ${{ inputs.upstream_commit }}
+          DSH_WEIXIN_UPSTREAM_VERSION: ${{ inputs.upstream_version }}
+          DSH_WEIXIN_REQUIRE_MEDIA: '1'
+          DSH_WEIXIN_LIVE_IMAGE_PATH: ${{ inputs.image_path }}
+          DSH_WEIXIN_LIVE_FILE_PATH: ${{ inputs.file_path }}
+          DSH_WEIXIN_LIVE_VIDEO_PATH: ${{ inputs.video_path }}
+        run: pnpm --filter @wsz987/channel-weixin test:live

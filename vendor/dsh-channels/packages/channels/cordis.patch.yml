@@ -1,0 +1,81 @@
+# DSH Bundle patch — @wsz987/dsh-channels
+#
+# Inserts the ChannelService, the Harness bridge and the five official
+# adapters into a DeepSeek Harness profile.
+#
+# Every channel below can be disabled through its own plugin config
+# (e.g. `plugins.channels-weixin.enabled = false`).
+#
+# `inject` names follow the Harness public service surface at bundle time;
+# adjust when the upstream service names change (converged in channel-harness).
+
+- insert:
+    - id: channels-service
+      name: '@wsz987/dsh-channels/service'
+
+    # Generic attachment compatibility backend.
+    # Required for non-image channel attachments until Harness provides native
+    # generic attachment support. Legacy v1 data remains readable even after a
+    # native backend becomes available.
+    - id: channels-files
+      name: '@wsz987/dsh-channels/files'
+
+    # Questions compose on the official `user-questions/request` waterfall.
+    # Untagged root listeners are always ADMITTED, but the waterfall is
+    # sequential and first-claim-wins: `@deepseek-ai/dsh-api-remotes` (official
+    # web profile) registers its forwarding answerer at boot, before this row,
+    # so the bridge PREPENDS its own answerer (see WaterfallQuestionBackend)
+    # instead of relying on fiber order. Declined presentations still delegate
+    # via `next()`.
+    - id: channels-harness
+      name: '@wsz987/dsh-channels/harness'
+      inject:
+        - channels
+        - agents
+        - agentDefaultModel
+        - agentPresets
+        - llm
+        - commands
+
+    - id: channels-control
+      name: '@wsz987/dsh-channels/control'
+      inject:
+        - channels
+        - credentials
+
+    - id: channels-weixin
+      name: '@wsz987/dsh-channels/weixin'
+      inject:
+        - channels
+        - channelControl
+
+    - id: channels-qq
+      name: '@wsz987/dsh-channels/qq'
+      inject:
+        - channels
+        - credentials
+        - channelControl
+
+    - id: channels-dingtalk
+      name: '@wsz987/dsh-channels/dingtalk'
+      inject:
+        - channels
+        - credentials
+        - channelControl
+
+    - id: channels-lark
+      name: '@wsz987/dsh-channels/lark'
+      inject:
+        - channels
+        - credentials
+        - channelControl
+
+    - id: channels-telegram
+      name: '@wsz987/dsh-channels/telegram'
+      inject:
+        - channels
+        - credentials
+        - channelControl
+
+    - id: channels-web
+      name: '@wsz987/dsh-channels'

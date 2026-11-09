@@ -1,0 +1,301 @@
+/**
+ * M7C: `DingTalkOpenApiPortImpl` — method inventory + official-behavior basis
+ * and media upload/send. Fully offline (fake transport).
+ */
+import { describe, expect, it } from 'vitest';
+import type { ChannelTarget } from '@wsz987/channel-core';
+import { ChannelError } from '@wsz987/channel-core';
+import {
+  DingTalkOpenApiPortImpl,
+  OFFICIAL_BASIS,
+  type HttpRequestInit,
+  type HttpTransport,
+} from '../src/index.ts';
+import type { DingTalkOpenApiPort } from '../src/index.ts';
+
+const API = 'https://api.dingtalk.com';
+const OAPI = 'https://oapi.dingtalk.com';
+const tokenPath = `${API}/v1.0/oauth2/accessToken`;
+
+class FakeTransport implements HttpTransport {
+  readonly calls: { path: string; init?: HttpRequestInit }[] = [];
+  readonly routes = new Map<string, () => unknown>();
+
+  route(path: string, response: () => unknown): this {
+    this.routes.set(path, response);
+    return this;
+  }
+
+  request(path: string, init?: HttpRequestInit): Promise<unknown> {
+    this.calls.push({ path, init });
+    const handler = this.routes.get(path);
+    if (!handler) return Promise.reject(new ChannelError('CHANNEL_ERROR', `no route for ${path}`));
+    return Promise.resolve(handler());
+  }
+}
+
+function target(raw: Record<string, unknown> = {}): ChannelTarget {
+  return {
+    channelId: 'dingtalk' as never,
+    accountId: 'main' as never,
+    conversationId: 'cid_123' as never,
+    conversationType: 'dm',
+    raw,
+  };
+}
+
+function secureFetch(data: Uint8Array, mimeType?: string, calls?: Array<{ url: string; options: Record<string, unknown> }>) {
+  return {
+    fetchBounded: async (url: string, options: Record<string, unknown>) => {
+      calls?.push({ url, options });
+      return { data, mimeType, finalUrl: 'https://dl.example.com/resolved' };
+    },
+  };
+}
+
+/** The full method surface the port must expose. */
+const PORT_METHODS = [
+  'getAccessToken',
+  'sendProactiveText',
+  'sendInteractiveCard',
+  'updateInteractiveCard',
+  'uploadMedia',
+  'sendMedia',
+  'createCard',
+  'updateCard',
+  'finishCard',
+  'resolveMedia',
+  'getMediaDownloadUrl',
+];
+
+describe('DingTalkOpenApiPortImpl — method inventory', () => {
+  it('exposes the full DingTalkOpenApiPort interface (shape)', () => {
+    const port: DingTalkOpenApiPort = new DingTalkOpenApiPortImpl({
+      transport: new FakeTransport(),
+      clientId: 'ding-app',
+      clientSecret: 'secret',
+    });
+    for (const method of PORT_METHODS) {
+      expect(typeof (port as unknown as Record<string, unknown>)[method], method).toBe('function');
+    }
+  });
+
+  it('every port method documents an official-behavior basis (marker presence)', () => {
+    for (const method of PORT_METHODS) {
+      const basis = OFFICIAL_BASIS[method];
+      expect(basis, method).toBeDefined();
+      expect(basis!.trim().length, method).toBeGreaterThan(0);
+      // Every entry either names the official connector oracle/endpoint,
+      // or is an explicit upstream-gap/deprecated marker with a reason.
+      const hasBasis =
+        basis!.includes('@dingtalk-real-ai/dingtalk-connector') ||
+        basis!.includes('@upstream-gap') ||
+        basis!.includes('@deprecated');
+      expect(hasBasis, `${method}: ${basis}`).toBe(true);
+    }
+  });
+
+  it('opaque media resolution follows the official downloadCode flow (M2A fix)', async () => {
+    // Official basis: connector downloadMediaByCode/getFileDownloadUrl —
+    // POST /v1.0/robot/messageFiles/download {downloadCode, robotCode} ->
+    // {downloadUrl} -> GET raw bytes.
+    expect(OFFICIAL_BASIS.resolveMedia).toContain('@dingtalk-real-ai/dingtalk-connector');
+    expect(OFFICIAL_BASIS.getMediaDownloadUrl).toContain('@dingtalk-real-ai/dingtalk-connector');
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${API}/v1.0/robot/messageFiles/download`, () => ({ downloadUrl: 'https://dl.example.com/pic' }));
+    const port = new DingTalkOpenApiPortImpl({
+      transport,
+      clientId: 'ding-app',
+      clientSecret: 'secret',
+      now: () => 1_000,
+      secureFetch: secureFetch(png),
+    });
+    const resolved = await port.resolveMedia('@lADP-media', {
+      downloadCode: 'dl-code-1',
+      robotCode: 'callback-robot-code-must-not-win',
+    });
+    expect(resolved.data).toEqual(png);
+    expect(resolved.mimeType).toBe('image/png');
+    expect(resolved.size).toBe(png.byteLength);
+    const downloadCall = transport.calls.find((c) => c.path.endsWith('/messageFiles/download'));
+    expect(downloadCall?.init?.body).toEqual({ downloadCode: 'dl-code-1', robotCode: 'ding-app' });
+  });
+
+  it('allows an HTTP download URL only when returned for an opaque DingTalk handle', async () => {
+    const fetchCalls: Array<{ url: string; options: Record<string, unknown> }> = [];
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${API}/v1.0/robot/messageFiles/download`, () => ({ downloadUrl: 'http://download.dingtalk.example/pic' }));
+    const port = new DingTalkOpenApiPortImpl({
+      transport,
+      clientId: 'ding-app',
+      clientSecret: 'secret',
+      secureFetch: secureFetch(new Uint8Array([1, 2, 3]), 'image/png', fetchCalls),
+    });
+
+    await port.resolveMedia('@opaque-picture', { downloadCode: 'dl-http' });
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]).toMatchObject({
+      url: 'http://download.dingtalk.example/pic',
+      options: { allowHttp: true },
+    });
+  });
+
+  it('resolves an embedded richText downloadCode reference', async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${API}/v1.0/robot/messageFiles/download`, () => ({ downloadUrl: 'https://dl.example.com/rich' }));
+    const port = new DingTalkOpenApiPortImpl({
+      transport,
+      clientId: 'ding-app',
+      clientSecret: 'secret',
+      secureFetch: secureFetch(png),
+    });
+    await port.resolveMedia('downloadCode:dl-rich');
+    const call = transport.calls.find((entry) => entry.path.endsWith('/messageFiles/download'));
+    expect(call?.init?.body).toEqual({ downloadCode: 'dl-rich', robotCode: 'ding-app' });
+  });
+
+  it('opaque media resolution without downloadCode fails closed (no invented protocol)', async () => {
+    const port = new DingTalkOpenApiPortImpl({ transport: new FakeTransport(), clientId: 'a', clientSecret: 'b' });
+    await expect(port.resolveMedia('mediaId_1')).rejects.toThrow('downloadCode');
+  });
+
+  it('does not allow HTTP for a direct media ref', async () => {
+    const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 0, 0, 0]);
+    const fetchCalls: Array<{ url: string; options: Record<string, unknown> }> = [];
+    const transport = new FakeTransport();
+    const port = new DingTalkOpenApiPortImpl({
+      transport,
+      clientId: 'a',
+      clientSecret: 'b',
+      secureFetch: secureFetch(jpeg, undefined, fetchCalls),
+    });
+    const resolved = await port.resolveMedia('http://cdn.example.com/a.jpg');
+    expect(resolved.data).toEqual(jpeg);
+    expect(resolved.mimeType).toBe('image/jpeg');
+    expect(fetchCalls[0]?.url).toBe('http://cdn.example.com/a.jpg');
+    expect(fetchCalls[0]?.options.allowHttp).toBe(false);
+  });
+});
+
+describe('DingTalkOpenApiPortImpl — interactive cards', () => {
+  it('sends and updates an interactive card through the official endpoints', async () => {
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${API}/v1.0/im/interactiveCards/send`, () => ({ processQueryKey: 'card-msg-1' }))
+      .route(`${API}/v1.0/im/interactiveCards`, () => ({ success: true }));
+    const port = new DingTalkOpenApiPortImpl({ transport, clientId: 'ding-app', clientSecret: 'secret', now: () => 1000 });
+    const sent = await port.sendInteractiveCard({
+      target: target({ robotCode: 'robot-1' }),
+      templateId: 'template-1.schema',
+      text: '请选择',
+      actions: [{ actions: [{ id: 'continue', label: '继续', style: 'primary' }] }],
+      textParam: 'text',
+      actionsParam: 'actions',
+    });
+    expect(sent.messageId).toBe('card-msg-1');
+    expect(sent.outTrackId).toMatch(/^action_1000_/);
+    const sendCall = transport.calls.find((call) => call.path.endsWith('/interactiveCards/send'));
+    expect(sendCall?.init?.body).toMatchObject({
+      cardTemplateId: 'template-1.schema',
+      openConversationId: 'cid_123',
+      robotCode: 'robot-1',
+      cardData: { cardParamMap: { text: '请选择', actions: JSON.stringify([{ id: 'continue', label: '继续', style: 'primary' }]) } },
+    });
+    await port.updateInteractiveCard({
+      outTrackId: sent.outTrackId,
+      text: '已选择继续',
+      actions: [],
+      textParam: 'text',
+      actionsParam: 'actions',
+    });
+    const updateCall = transport.calls.find((call) => call.path.endsWith('/interactiveCards') && call.init?.method === 'PUT');
+    expect(updateCall?.init?.body).toEqual({
+      outTrackId: sent.outTrackId,
+      cardData: { cardParamMap: { text: '已选择继续', actions: '[]' } },
+    });
+  });
+});
+
+describe('DingTalkOpenApiPortImpl — media upload/send', () => {
+  it('uploadMedia then sendMedia: upload called first, mediaId flows into send', async () => {
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${OAPI}/media/upload?access_token=token-1&type=file`, () => ({ media_id: '@media_abc' }))
+      .route(`${API}/v1.0/robot/groupMessages/send`, () => ({ messageId: 'msg_1' }));
+    const port = new DingTalkOpenApiPortImpl({
+      transport,
+      clientId: 'ding-app',
+      clientSecret: 'secret',
+      now: () => 1_000,
+    });
+
+    const uploaded = await port.uploadMedia({
+      robotCode: 'ding-app',
+      fileName: 'report.pdf',
+      mimeType: 'application/pdf',
+      data: new Uint8Array([10, 20, 30]),
+      mediaType: 'file',
+    });
+    expect(uploaded.mediaId).toBe('@media_abc');
+
+    const sent = await port.sendMedia({
+      conversationId: 'cid_1',
+      robotCode: 'ding-app',
+      mediaId: uploaded.mediaId,
+      msgtype: 'file',
+      name: 'report.pdf',
+    });
+    expect(sent.messageId).toBe('msg_1');
+
+    // Official method mapping: upload endpoint first, then robot groupMessages/send
+    // carrying the SAME mediaId returned by the upload.
+    const uploadCall = transport.calls.find((c) => c.path.includes('/media/upload?access_token=token-1&type=file'));
+    const sendCall = transport.calls.find((c) => c.path.includes('/v1.0/robot/groupMessages/send'));
+    expect(uploadCall).toBeDefined();
+    expect(uploadCall!.init!.body).toBeInstanceOf(FormData);
+    expect((uploadCall!.init!.body as FormData).get('media')).toBeInstanceOf(File);
+    expect(sendCall).toBeDefined();
+    const msgParam = JSON.parse((sendCall!.init!.body as Record<string, string>).msgParam);
+    expect(msgParam).toEqual({ mediaId: '@media_abc', fileName: 'report.pdf', fileType: 'pdf' });
+    expect((sendCall!.init!.body as Record<string, unknown>).msgKey).toBe('sampleFile');
+    expect(sendCall!.init!.headers?.['x-acs-dingtalk-access-token']).toBe('token-1');
+  });
+
+  it('rejects a media upload response missing mediaId', async () => {
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${OAPI}/media/upload?access_token=token-1&type=file`, () => ({ ok: true }));
+    const port = new DingTalkOpenApiPortImpl({ transport, clientId: 'a', clientSecret: 'b' });
+    await expect(port.uploadMedia({ robotCode: 'a', fileName: 'x.bin', data: new Uint8Array([1]), mediaType: 'file' }))
+      .rejects.toThrow('missing mediaId');
+  });
+
+  it('uploads an image as type=image and sends the connector image payload', async () => {
+    const transport = new FakeTransport()
+      .route(tokenPath, () => ({ accessToken: 'token-1', expireIn: 7200 }))
+      .route(`${OAPI}/media/upload?access_token=token-1&type=image`, () => ({ media_id: '@image_abc' }))
+      .route(`${API}/v1.0/robot/groupMessages/send`, () => ({ messageId: 'image_msg_1' }));
+    const port = new DingTalkOpenApiPortImpl({ transport, clientId: 'ding-app', clientSecret: 'secret' });
+
+    const uploaded = await port.uploadMedia({
+      robotCode: 'ding-app',
+      fileName: 'chart.png',
+      mimeType: 'image/png',
+      data: new Uint8Array([1, 2, 3]),
+      mediaType: 'image',
+    });
+    await port.sendMedia({
+      conversationId: 'cid_1', robotCode: 'ding-app', mediaId: uploaded.mediaId, msgtype: 'image', name: 'chart.png',
+    });
+
+    const sendCall = transport.calls.find((c) => c.path.includes('/v1.0/robot/groupMessages/send'));
+    expect((sendCall!.init!.body as Record<string, unknown>).msgKey).toBe('sampleImageMsg');
+    expect(JSON.parse((sendCall!.init!.body as Record<string, string>).msgParam)).toEqual({ photoURL: '@image_abc' });
+  });
+});

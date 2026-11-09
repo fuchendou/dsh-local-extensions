@@ -1,0 +1,56 @@
+{
+  "name": "inbound group message mentioning another bot",
+  "channel": "telegram",
+  "upstreamVersion": "10.2",
+  "payload": {
+    "update_id": 1012,
+    "message": {
+      "message_id": 512,
+      "date": 1700000011,
+      "chat": {
+        "id": -100200300,
+        "type": "supergroup",
+        "title": "Harness Lab"
+      },
+      "from": {
+        "id": 400500600,
+        "is_bot": false,
+        "first_name": "Alice",
+        "username": "alice_user"
+      },
+      "text": "@other_bot hello",
+      "entities": [
+        {
+          "type": "mention",
+          "offset": 0,
+          "length": 10
+        }
+      ]
+    }
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "telegram",
+    "accountId": "main",
+    "conversation": {
+      "id": "-100200300",
+      "type": "group"
+    },
+    "sender": {
+      "id": "400500600",
+      "name": "Alice"
+    },
+    "message": {
+      "id": "512",
+      "content": [
+        {
+          "type": "text",
+          "text": "@other_bot hello"
+        }
+      ],
+      "activation": {
+        "mentionedBot": false
+      }
+    }
+  }
+}

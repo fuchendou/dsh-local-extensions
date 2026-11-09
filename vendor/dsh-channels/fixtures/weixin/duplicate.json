@@ -1,0 +1,41 @@
+{
+  "name": "duplicate message (cursor crash replay)",
+  "channel": "weixin",
+  "upstreamVersion": "ilink",
+  "payload": {
+    "message_id": 2002,
+    "from_user_id": "user_123",
+    "to_user_id": "bot_abc",
+    "create_time_ms": 1700000001000,
+    "item_list": [
+      {
+        "type": 1,
+        "text_item": {
+          "text": "hi again"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "weixin",
+    "accountId": "main",
+    "conversation": {
+      "id": "user_123",
+      "type": "dm"
+    },
+    "sender": {
+      "id": "user_123"
+    },
+    "message": {
+      "id": "wx-2002",
+      "content": [
+        {
+          "type": "text",
+          "text": "hi again"
+        }
+      ],
+      "createdAt": 1700000001000
+    }
+  }
+}

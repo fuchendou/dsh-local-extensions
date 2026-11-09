@@ -1,0 +1,36 @@
+{
+  "name": "inbound video (opaque file_key per SDK media body)",
+  "channel": "lark",
+  "upstreamVersion": "m3",
+  "payload": {
+    "type": "video",
+    "msgId": "msg_vid_1",
+    "senderId": "ou_123",
+    "conversationId": "oc_456",
+    "chatType": "group",
+    "mediaUrl": "file_v2_movie_1",
+    "durationMs": 8200
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "lark",
+    "accountId": "main",
+    "conversation": {
+      "id": "oc_456",
+      "type": "group"
+    },
+    "sender": {
+      "id": "ou_123"
+    },
+    "message": {
+      "id": "msg_vid_1",
+      "content": [
+        {
+          "type": "video",
+          "resourceRef": "file_v2_movie_1",
+          "durationMs": 8200
+        }
+      ]
+    }
+  }
+}

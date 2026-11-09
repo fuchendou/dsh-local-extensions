@@ -1,0 +1,102 @@
+{
+  "name": "@wsz987/dsh-channels",
+  "version": "0.5.2-personalai.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wsz987/dsh-channels.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Connect WeChat, QQ, DingTalk, Lark and Telegram to DeepSeek Harness — unified config, QR-code auth, chat with your Agent from IM",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./service": {
+      "types": "./lib/service.d.ts",
+      "default": "./lib/service.js"
+    },
+    "./files": {
+      "types": "./lib/files.d.ts",
+      "default": "./lib/files.js"
+    },
+    "./harness": {
+      "types": "./lib/harness.d.ts",
+      "default": "./lib/harness.js"
+    },
+    "./control": {
+      "types": "./lib/control.d.ts",
+      "default": "./lib/control.js"
+    },
+    "./weixin": {
+      "types": "./lib/weixin.d.ts",
+      "default": "./lib/weixin.js"
+    },
+    "./qq": {
+      "types": "./lib/qq.d.ts",
+      "default": "./lib/qq.js"
+    },
+    "./dingtalk": {
+      "types": "./lib/dingtalk.d.ts",
+      "default": "./lib/dingtalk.js"
+    },
+    "./lark": {
+      "types": "./lib/lark.d.ts",
+      "default": "./lib/lark.js"
+    },
+    "./telegram": {
+      "types": "./lib/telegram.d.ts",
+      "default": "./lib/telegram.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "clean": "rimraf lib"
+  },
+  "dependencies": {
+    "@wsz987/channel-core": "workspace:*",
+    "@wsz987/channel-dingtalk": "workspace:*",
+    "@wsz987/channel-files": "workspace:*",
+    "@wsz987/channel-harness": "workspace:*",
+    "@wsz987/channel-lark": "workspace:*",
+    "@wsz987/channel-telegram": "workspace:*",
+    "@wsz987/channel-qq": "workspace:*",
+    "@wsz987/channel-weixin": "workspace:*",
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@wsz987/channel-web": "workspace:*",
+    "@wsz987/channel-control": "workspace:*"
+  },
+  "devDependencies": {
+    "rimraf": "^6.0.0",
+    "@deepseek-ai/cordis-plugin-include": "1.0.10"
+  },
+  "license": "MIT"
+}

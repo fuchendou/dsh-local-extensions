@@ -1,0 +1,138 @@
+/**
+ * Doctor surface for all four official channels (M4 — `pnpm doctor`).
+ *
+ * Instantiates the real Weixin / QQ / DingTalk / Lark adapters with minimal
+ * configs, runs diagnose over all four and asserts each diagnostic is in an
+ * expected state (weixin is 'experimental' until the live gate passes; the
+ * others are 'tested'), then prints the formatted doctor output — exactly
+ * the surface CI prints via pnpm doctor.
+ *
+ * All four adapters expose a `readonly manifest` class field that the
+ * doctor reads structurally.
+ */
+import { describe, expect, it } from 'vitest';
+import {
+  diagnose,
+  formatDoctor,
+  formatUpstreamSection,
+  manifestVerdict,
+} from '../src/index.ts';
+import { WeixinAdapter } from '../../channel-weixin/src/adapter.ts';
+import { Config as WeixinConfig } from '../../channel-weixin/src/config.ts';
+import { DingTalkAdapter } from '../../channel-dingtalk/src/adapter.ts';
+import { Config as DingTalkConfig } from '../../channel-dingtalk/src/config.ts';
+import { QQAdapter } from '../../channel-qq/src/adapter.ts';
+import { Config as QQConfig } from '../../channel-qq/src/config.ts';
+import { LarkAdapter } from '../../channel-lark/src/adapter.ts';
+import { Config as LarkConfig } from '../../channel-lark/src/config.ts';
+
+const weixin = new WeixinAdapter(
+  WeixinConfig({
+    enabled: true,
+    accountId: 'main',
+    baseUrl: 'http://fake',
+    timeoutMs: 1000,
+    longPollTimeoutMs: 1000,
+    auth: { statePath: undefined, qrPollIntervalMs: 100, qrExpireMs: 10000 },
+    reconnect: { enabled: false, baseDelayMs: 1, maxDelayMs: 10, maxRetries: 2 },
+    dedup: { enabled: true, windowMs: 5000 },
+  }),
+);
+
+const qq = new QQAdapter(
+  QQConfig({
+    enabled: true,
+    accountId: 'main',
+    appId: 'dummy-app-id',
+    appSecretRef: 'QQBOT_APP_SECRET',
+    markdownSupport: false,
+    streaming: { enabled: true, throttleMs: 500 },
+    dedup: { enabled: true, windowMs: 5000 },
+    startupTimeoutMs: 15000,
+  }),
+);
+
+const dingtalk = new DingTalkAdapter(
+  DingTalkConfig({
+    enabled: true,
+    accountId: 'main',
+    baseUrl: 'http://fake',
+    timeoutMs: 1000,
+    longPollTimeoutMs: 1000,
+    reconnect: { enabled: false, baseDelayMs: 1, maxDelayMs: 10, maxRetries: 2 },
+    dedup: { enabled: true, windowMs: 5000 },
+    card: { createOnFirstDelta: true },
+  }),
+);
+
+const lark = new LarkAdapter(
+  LarkConfig({
+    enabled: true,
+    accountId: 'main',
+    baseUrl: 'http://fake',
+    timeoutMs: 1000,
+    longPollTimeoutMs: 1000,
+    reconnect: { enabled: false, baseDelayMs: 1, maxDelayMs: 10, maxRetries: 2 },
+    dedup: { enabled: true, windowMs: 5000 },
+    card: { createOnFirstDelta: true },
+  }),
+);
+
+describe('doctor — all four official channels (M4 surface)', () => {
+  it('produces a tested diagnostic for every channel and renders the doctor output', async () => {
+    const diagnostics = await diagnose([weixin, qq, dingtalk, lark]);
+    expect(diagnostics).toHaveLength(4);
+
+    const ids = diagnostics.map((d) => d.id).sort();
+    expect(ids).toEqual(['dingtalk', 'lark', 'qq', 'weixin']);
+
+    const expectedCompat: Record<string, 'tested' | 'experimental'> = {
+      weixin: 'experimental',
+      qq: 'tested',
+      dingtalk: 'tested',
+      lark: 'tested',
+    };
+    for (const d of diagnostics) {
+      expect(d.compatibility).toBe(expectedCompat[d.id]);
+      expect(manifestVerdict(d.compatibility)).toBe(
+        d.compatibility === 'experimental' ? 'warning' : 'ok',
+      );
+      expect(d.adapterVersion.length).toBeGreaterThan(0);
+      expect(d.upstreamReference.length).toBeGreaterThan(0);
+      expect(d.upstreamTestedVersion.length).toBeGreaterThan(0);
+      expect(d.upstreamVersionRange.length).toBeGreaterThan(0);
+    }
+
+    const text = formatDoctor(diagnostics);
+    for (const id of ['weixin', 'qq', 'dingtalk', 'lark']) {
+      expect(text).toContain(id);
+      expect(text).toContain('Compatibility: ' + expectedCompat[id]);
+    }
+
+    // The doctor surface CI prints via `pnpm doctor`.
+    console.log(text);
+  });
+
+  it('renders a fixed upstream section per official channel (M8)', async () => {
+    const diagnostics = await diagnose([weixin, qq, dingtalk, lark]);
+    const text = formatDoctor(diagnostics);
+
+    const expected: Record<string, { pkg: string; strategy: string }> = {
+      weixin: { pkg: '@tencent-weixin/openclaw-weixin@2.4.6', strategy: 'source-port' },
+      qq: { pkg: '@tencent-connect/qqbot-nodejs@1.0.4', strategy: 'official-sdk' },
+      lark: { pkg: '@larksuiteoapi/node-sdk@1.73.1', strategy: 'official-sdk' },
+      dingtalk: { pkg: 'dingtalk-stream@2.1.5', strategy: 'minimal-official-api-port' },
+    };
+    for (const [id, want] of Object.entries(expected)) {
+      expect(text).toContain(`Channel: ${id}`);
+      expect(text).toContain(`upstream = ${want.pkg}`);
+      expect(text).toContain(`strategy = ${want.strategy}`);
+      expect(text).toContain('status = compatible');
+    }
+
+    // What each channel's own upstream section looks like.
+    for (const d of diagnostics) {
+      expect(formatUpstreamSection(d)).toContain(`Channel: ${d.id}`);
+    }
+  });
+});

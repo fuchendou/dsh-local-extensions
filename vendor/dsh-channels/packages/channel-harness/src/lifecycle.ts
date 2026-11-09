@@ -1,0 +1,422 @@
+/**
+ * Bridge lifecycle assembly (doc §4 / §40).
+ *
+ * `startBridge(ctx, config, persistence?)` wires everything together and
+ * returns a disposer with the mandated stop order (doc 4.3):
+ * 1. stop new inbound (unregister the ChannelService listener);
+ * 2. drain active turns (`whenIdle`, bounded by a timeout);
+ * 3. RECONCILE replies from the Session durable log — final-reply correctness
+ *    comes from the (durable) Session log, not from the `session/event`
+ *    listener still being attached;
+ * 4. flush any replies still marked active (`ReplyRouter.flushAll`);
+ * 5. stop listening to `session/event`;
+ * 6. dispose all owned agent handles;
+ * 7. dispose the ReplyRouter (clear timers).
+ *
+ * Persistence is an OPTIONAL capability resolved LIVE at the use site: the
+ * caller passes a resolver (`() => ctx.get('sessionPersistence')`), and the
+ * gateway's `canResume()` / probes reflect whether it is present RIGHT NOW —
+ * mounting, unmounting, or replacing the service after startup is observed on
+ * the next probe (never a startup snapshot).
+ *
+ * Two reply-context correlation listeners (`agent/inbox/claimed` and
+ * `agent/inbox/discarded`) are registered on the Cordis context; they are
+ * plain `ctx.on`, so they auto-dispose with the context and stay active for
+ * the whole bridge lifetime.
+ */
+import type { Context } from '@deepseek-ai/cordis';
+import { join } from 'node:path';
+import { ChannelSessionControl } from './session-control.js';
+import { ChannelSessionIndex } from './session-index.js';
+import { resolveChannelDataDir } from './dsh-home.js';
+import { InboundAccessController } from './access/controller.js';
+import type { SessionPersistence } from '@deepseek-ai/dsh-session-persistence';
+import { SessionId, type Session, type SessionStore } from '@deepseek-ai/dsh-session';
+import type { ChannelAdapter, ChannelEvent, ChannelLogger, ChannelService, ChannelTarget } from '@wsz987/channel-core';
+import type { Config } from './config.js';
+import { createBindingStore } from './binding-store.js';
+import { AgentManager, HarnessAgentGateway, resolvePersistedInspection } from './agent-manager.js';
+import { confirmBindTarget, resolveBindTarget } from './bind-support.js';
+import { AgentRouter } from './agent-router.js';
+import { ReplyRouter } from './reply-router.js';
+import { ChannelHarnessBridge } from './bridge.js';
+import { ChannelOutboxService } from './outbox/service.js';
+import { OutboxError } from './outbox/types.js';
+import { HarnessChannelWorkspaceResolver } from './workspace-resolver.js';
+import { ReplyContextStore, type ChannelReplyContext } from './reply-context-store.js';
+import type { ChannelHarnessBridgeOptions } from './bridge.js';
+import type { SaveImageHook } from './message-converter.js';
+import { installDebugConsoleExporter } from './debug-logger.js';
+import { StoredChannelAccessPolicyResolver } from './access/resolver.js';
+import type { ChannelAttachmentProvider } from './file-provider.js';
+import { liveAttachmentProvider } from './file-provider.js';
+import { createQuestionInteraction } from './interactions/question-backend.js';
+import type {
+  ChannelUserQuestionService,
+} from './interactions/index.js';
+
+export interface BridgeLifecycle {
+  dispose(): Promise<void>;
+  handleChannelEvent(event: ChannelEvent): Promise<void>;
+}
+
+export function startBridge(
+  ctx: Context,
+  config: Config,
+  resolvePersistence?: () => SessionPersistence | undefined,
+): BridgeLifecycle {
+  installDebugConsoleExporter(ctx);
+  const logger: ChannelLogger = ctx.logger('channel-harness');
+  const channels = ctx.get('channels') as ChannelService;
+
+  const bindingStore = createBindingStore(config.bindingStore);
+  const agentGateway = new HarnessAgentGateway(ctx, resolvePersistence);
+  const agentManager = new AgentManager(agentGateway, logger, config.maxConcurrency);
+  const agentRouter = new AgentRouter(config);
+  const workspaceResolver = new HarnessChannelWorkspaceResolver(ctx, config.workspace, logger);
+  const getAdapter = (channelId: string): ChannelAdapter | undefined =>
+    channels.get(channelId);
+
+  const replyContexts = new ReplyContextStore();
+  // Question answerer composition: the channel composes ONE PREPENDED answerer
+  // on the official `user-questions/request` waterfall — headless it is
+  // typically the only answerer; in the Web profile it must win over the
+  // official Remote/Web answerer (which registers at boot, before this bridge)
+  // or every channel-bound ask would be swallowed by the browser. A declined
+  // presentation still delegates via `next()`. Everything lives in
+  // interactions/question-backend.ts.
+  const questionPresenter = config.userQuestions.enabled
+    ? createQuestionInteraction({
+        ctx,
+        getUserQuestions: () => ctx.get('userQuestions') as ChannelUserQuestionService | undefined,
+        agentManager,
+        replyContexts,
+        getAdapter,
+        logger,
+        timeoutMs: config.userQuestions.timeoutMs,
+      })
+    : undefined;
+  questionPresenter?.start();
+
+  // Optional attachment service -> real image path (WX5). Resolved LIVE at
+  // every use, exactly like `sessionPersistence` above: the profile entry group
+  // creates every row concurrently (`Promise.allSettled`), so a startup
+  // snapshot can precede the service's own fiber. A deployment without an
+  // attachment backend keeps today's fallback — the hook throws, `imageBlock`
+  // catches, and the converter emits the deterministic text placeholder.
+  const saveImage: SaveImageHook = async (input) => {
+    const attachments = ctx.get('attachments');
+    if (!attachments) {
+      throw new Error('the Harness attachments service is not mounted');
+    }
+    return attachments.saveImage(input);
+  };
+
+  // Optional generic-file extension. Harness currently has a native image
+  // service but no generic FileBlock/FileAttachment surface, so deployments
+  // may provide this separately without coupling document parsers to the
+  // bridge. The provider is resolved LIVE per call (see
+  // `liveAttachmentProvider`): the bundle's `channels-files` row loads
+  // concurrently with this plugin, and deleting that row must stay supported.
+  const resolveFileProvider = (): ChannelAttachmentProvider | undefined =>
+    ctx.get('channelFiles') as ChannelAttachmentProvider | undefined;
+  const fileProvider: ChannelAttachmentProvider = liveAttachmentProvider(resolveFileProvider);
+
+  // Best-effort typing indicator wiring: a typing API failure must NEVER break
+  // the inbound/outbound flow, so every call is fire-and-forget with a swallow.
+  const startTyping = (sessionId: string, context?: ChannelReplyContext): void => {
+    const binding = agentManager.bindingFor(sessionId);
+    if (!binding) return;
+    const adapter = getAdapter(binding.channelId);
+    if (adapter?.startTypingForTarget && context) {
+      void adapter.startTypingForTarget(typingTarget(binding, context)).catch(() => {});
+      return;
+    }
+    if (adapter?.startTyping) void adapter.startTyping(binding.conversationId).catch(() => {});
+  };
+  const stopTyping = (sessionId: string, context?: ChannelReplyContext): void => {
+    const binding = agentManager.bindingFor(sessionId);
+    if (!binding) return;
+    const adapter = getAdapter(binding.channelId);
+    if (adapter?.stopTypingForTarget && context) {
+      void adapter.stopTypingForTarget(typingTarget(binding, context)).catch(() => {});
+      return;
+    }
+    if (adapter?.stopTyping) void adapter.stopTyping(binding.conversationId).catch(() => {});
+  };
+
+  ctx.on(
+    'agent/inbox/claimed',
+    ({ agent, message, turn }: { agent: { session: { id: string } }; message: { id: string }; turn: number }) => {
+      const context = replyContexts.claim({
+        sessionId: String(agent.session.id),
+        messageId: String(message.id),
+        turn,
+      });
+      startTyping(String(agent.session.id), context);
+    },
+  );
+  ctx.on(
+    'agent/inbox/discarded',
+    ({ message }: { message: { id: string } }) => {
+      // Resolve the session id BEFORE dropping the pending entry so we can
+      // cancel any typing the (never-claimed) inbound would have triggered.
+      const messageId = String(message.id);
+      const sessionId = replyContexts.pendingSessionId(messageId);
+      const context = replyContexts.pendingContext(messageId);
+      replyContexts.discard(messageId);
+      if (sessionId) stopTyping(sessionId, context);
+    },
+  );
+
+  const replyRouter = new ReplyRouter({
+    config: config.reply,
+    getAdapter,
+    getBinding: (sessionId) => agentManager.bindingFor(sessionId),
+    replyContexts,
+    logger,
+  });
+  const stopListening = replyRouter.attach(ctx);
+
+  // Deferred bridge reference: `commandDeps` routes the /new command backed by
+  // the bridge back to the bridge's own fresh-session bootstrap. The arrow only
+  // calls `bridge.startNewSession` at runtime (when a command actually runs), by
+  // which point the bridge is assigned (definite-assignment assertion below).
+  // Durable outbox: the proactive send path. The
+  // binding authority is the DURABLE store (never AgentManager's hint cache),
+  // and the adapter lookup + asset store are the same ones the reply pipeline
+  // uses. Optional: absent -> the send_channel_message tool is not installed.
+  const outbox = new ChannelOutboxService({
+    bindingStore,
+    getAdapter,
+    // Live again: the resolver runs per send, so a provider mounted after the
+    // bridge started (or an HMR replacement) is picked up instead of leaving
+    // the outbox permanently without an attachment resolver (issue #7).
+    attachmentResolver: async (attachmentId, sessionId) => {
+      const provider = resolveFileProvider();
+      if (!provider) {
+        throw new OutboxError(
+          'OUTBOX_CAPABILITY_UNAVAILABLE',
+          'outbound attachments require a private asset store that is not configured',
+          { sessionId },
+        );
+      }
+      return provider.resolveAttachment(attachmentId, sessionId);
+    },
+    logger,
+  });
+
+  let bridge!: ChannelHarnessBridge;
+  const commandDeps: ChannelHarnessBridgeOptions['commandDeps'] = {
+    startNewSession: (agent) => bridge.startNewSession(agent),
+    // /mirror (issue #5): the toggle state lives on the durable binding.
+    mirror: {
+      get: async (agent) =>
+        (await bindingStore.findBySessionId(String(agent.id)))?.mirror === true,
+      set: async (agent, on) => {
+        const binding = await bindingStore.findBySessionId(String(agent.id));
+        if (!binding) throw new Error(`no session binding for '${String(agent.id)}'`);
+        await bindingStore.put({ ...binding, mirror: on, updatedAt: Date.now() });
+      },
+    },
+    // /bind (issue #6): fail-closed rebind support over the durable bindings
+    // and the persisted session universe.
+    bind: {
+      resolve: (agent, query) =>
+        resolveBindTarget(agentGateway, bindingStore, agent, query),
+      confirm: (agent, sessionId) =>
+        confirmBindTarget(agentGateway, bindingStore, agent, sessionId),
+    },
+  };
+  // Fail-closed Access Gate: production ALWAYS resolves the
+  // policy from the shared ChannelStorage and logs decisions on the
+  // `channel-access` namespace. Reads once per inbound — no policy caching (§16).
+  const accessResolver = new StoredChannelAccessPolicyResolver(
+    () => channels.resources.storage,
+  );
+  const accessLogger = ctx.logger('channel-access');
+  const sessions = config.sessionControl?.enabled ? new ChannelSessionControl(ctx,
+    new ChannelSessionIndex(config.bindingStore.type === 'memory' ? undefined
+      : config.sessionControl.path || (config.bindingStore.path ? `${config.bindingStore.path}.sessions.json` : join(resolveChannelDataDir(), 'sessions.json'))),
+    bindingStore, {
+      create: (agent, background) => bridge.createSessionFor(agent, background),
+      acquire: binding => bridge.acquireSession(binding),
+      events: async id => {
+        const live = ctx.get('sessions')?.get(SessionId(id));
+        if (live) return live.snapshotEvents();
+        const persistence = resolvePersistence?.();
+        if (!persistence) throw new Error('会话持久化服务未就绪。');
+        return (await resolvePersistedInspection(persistence, SessionId(id)))?.events ?? [];
+      },
+      authorized: async binding => {
+        if (!binding.senderId) return false;
+        const resolved = await accessResolver.resolve(binding.channelId, binding.accountId);
+        return resolved.state === 'present' && new InboundAccessController().authorize({
+          conversationType: binding.conversationType, conversationId: binding.conversationId,
+          senderId: binding.senderId, mentionedBot: true, policy: resolved.policy,
+        }).authorized;
+      },
+      adapter: getAdapter,
+      replyContext: (sessionId, turn) => replyContexts.getTurn(sessionId, turn),
+    }) : undefined;
+  bridge = new ChannelHarnessBridge({
+    sessions,
+    config,
+    bindingStore,
+    agentManager,
+    agentRouter,
+    getAdapter,
+    replyContexts,
+    logger,
+    accessResolver,
+    accessLogger,
+    saveImage,
+    fileProvider,
+    ctx,
+    commandDeps,
+    workspaceResolver,
+    outbox,
+    questionPresenter,
+  });
+  const stopInbound = channels.on((event) => bridge.handleChannelEvent(event));
+  sessions?.start();
+  const recovery = sessions ? ctx.inject(['goals', 'sessionPersistence'], async () => {
+    await sessions.recover();
+  }) : undefined;
+
+  let disposed = false;
+
+  async function dispose(): Promise<void> {
+    if (disposed) return;
+    disposed = true;
+    // 1. Stop new inbound (adapter events no longer reach the bridge).
+    stopInbound();
+    await recovery?.dispose();
+    await sessions?.stop();
+    // Cancel channel-owned question waits before draining the blocked Agent.
+    await questionPresenter?.stop();
+    // Release this bridge's Agent-scoped commands before a replacement bridge
+    // can borrow the same live agents and install fresh handlers.
+    await bridge.disposeCommandSetups();
+    // 2. Drain active turns with a bounded wait (the session/event listener is
+    //    still attached here, but we do NOT depend on it for final-reply
+    //    correctness).
+    await drainActiveTurns(agentManager, replyRouter, logger, config.drainTimeoutMs);
+    // 3. RECONCILE replies from the Session durable log (final text delivery
+    //    does NOT rely on the listener still being attached).
+    await reconcileReplies(ctx, resolvePersistence, agentManager, replyRouter, logger);
+    // 4. Finalize any replies still marked active whose turn/end never arrived.
+    await replyRouter.flushAll();
+    // 5. Stop listening to session/event.
+    stopListening();
+    // 6. Dispose owned agent handles (each exactly once).
+    await agentManager.disposeAll();
+    // 7. Dispose the reply router (clear timers).
+    replyRouter.dispose();
+  }
+
+  return {
+    dispose,
+    handleChannelEvent: (event) => bridge.handleChannelEvent(event),
+  };
+}
+
+function typingTarget(
+  binding: { channelId: string; accountId: string; conversationId: string; threadId?: string },
+  context: ChannelReplyContext,
+): ChannelTarget {
+  return {
+    channelId: binding.channelId as ChannelTarget['channelId'],
+    accountId: binding.accountId as ChannelTarget['accountId'],
+    conversationId: binding.conversationId as ChannelTarget['conversationId'],
+    threadId: binding.threadId as ChannelTarget['threadId'],
+    conversationType: context.conversationType,
+    replyToMessageId: context.replyToMessageId as ChannelTarget['replyToMessageId'],
+    raw: context.raw,
+    runId: context.runId,
+  };
+}
+
+async function drainActiveTurns(
+  agentManager: AgentManager,
+  replyRouter: ReplyRouter,
+  logger: ChannelLogger,
+  drainTimeoutMs: number,
+): Promise<void> {
+  const sessionIds = replyRouter.activeSessions();
+  if (sessionIds.length === 0) return;
+  await Promise.all(
+    sessionIds.map(async (sessionId) => {
+      const ref = agentManager.refFor(sessionId);
+      if (!ref) return;
+      const timedOut = await withTimeout(ref.whenIdle(), drainTimeoutMs);
+      if (timedOut) {
+        logger.warn(`[channel-harness] drain timed out for session '${sessionId}'`);
+      }
+    }),
+  );
+}
+
+/**
+ * Reconcile every active session's reply from the durable log. Reads the live
+ * Session when it is still in the store; otherwise inspects persistence
+ * (resolved LIVE at dispose time — the currently mounted backend, whatever
+ * the bridge started with). Skips gracefully when neither is available.
+ * Final-reply correctness comes from the Session log, not from the
+ * still-attached event listener.
+ */
+async function reconcileReplies(
+  ctx: Context,
+  resolvePersistence: (() => SessionPersistence | undefined) | undefined,
+  agentManager: AgentManager,
+  replyRouter: ReplyRouter,
+  logger: ChannelLogger,
+): Promise<void> {
+  const sessionIds = agentManager.activeSessions();
+  if (sessionIds.length === 0) return;
+  const sessions = ctx.get('sessions') as SessionStore | undefined;
+  const persistence = resolvePersistence?.();
+  for (const sessionId of sessionIds) {
+    try {
+      const live = sessions?.get(SessionId(sessionId)) as Session | undefined;
+      if (live) {
+        await replyRouter.reconcileSession({ id: sessionId, events: live.snapshotEvents() });
+        continue;
+      }
+      if (persistence) {
+        // V3 persistence inspection uses the public read handle.
+        const inspection = await resolvePersistedInspection(persistence, SessionId(sessionId));
+        if (inspection) {
+          await replyRouter.reconcileSession({ id: sessionId, events: inspection.events });
+        }
+      }
+      // else: no live session and no persistence — skip gracefully.
+    } catch (error) {
+      logger.warn(`[channel-harness] reconcile failed for session '${sessionId}'`, error);
+    }
+  }
+}
+
+/** Resolve true when the timeout elapses before the promise settles. */
+function withTimeout(promise: Promise<void>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) resolve(true);
+    }, ms);
+    promise.then(
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(false);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}

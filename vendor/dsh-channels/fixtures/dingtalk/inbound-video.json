@@ -1,0 +1,35 @@
+{
+  "name": "inbound video",
+  "channel": "dingtalk",
+  "upstreamVersion": "m2",
+  "payload": {
+    "type": "video",
+    "msgId": "msg_vid_1",
+    "senderId": "user_123",
+    "conversationId": "conv_456",
+    "mediaUrl": "https://example.com/v.mp4",
+    "durationMs": 8000
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "dingtalk",
+    "accountId": "main",
+    "conversation": {
+      "id": "conv_456",
+      "type": "dm"
+    },
+    "sender": {
+      "id": "user_123"
+    },
+    "message": {
+      "id": "msg_vid_1",
+      "content": [
+        {
+          "type": "video",
+          "url": "https://example.com/v.mp4",
+          "durationMs": 8000
+        }
+      ]
+    }
+  }
+}

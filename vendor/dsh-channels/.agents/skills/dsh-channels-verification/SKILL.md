@@ -1,0 +1,715 @@
+---
+name: dsh-channels-verification
+description: 核验 wsz987/dsh-channels 当前代码架构、各渠道插件/上游、配置与凭据字段、实际接口、平台权限和官方文档，并识别代码/文档/平台能力漂移。用于新增渠道、升级 SDK、发布前检查、排查权限问题、维护 channel-web 渠道设置页。
+title: DSH Channels 渠道核验 Skill
+summary: 以当前代码为实现事实，以官方平台文档为权限事实，核验 Weixin / QQ / DingTalk / Lark / Telegram。
+when_to_use: 渠道核验 | SDK 升级 | 权限核验 | 插件升级 | channel-web | 发布检查 | live verification
+authoritative: 核验流程、事实优先级、渠道字段与接口映射、权限核验规则、已知漂移项。
+see_also: [references/channel-matrix.md, references/official-sources.md, references/audit-checklist.md]
+status: snapshot
+metadata:
+  repository: https://github.com/wsz987/dsh-channels
+  branch: main
+  snapshot_commit: 78655a40a266c4122ecd0c030b0a882fdb92f2df
+  snapshot_date: 2026-08-19
+---
+
+# DSH Channels Verification Skill
+
+> **快照基线**：`main@78655a40a266c4122ecd0c030b0a882fdb92f2df`（2026-08-19）。
+>
+> **后续同步**：工作树 `2781f7a1b83613ea0c5675731bb6afbcb3ce4e12` 已将 Telegram
+> manifest、fixtures 与类型基线迁移到 Bot API 10.2；真实 Bot live gate 仍未完成。
+>
+> 这个 Skill 的目的不是描述“理想设计”，而是让 AI 在后续维护时能区分：
+>
+> 1. **当前代码真的做了什么**
+> 2. **仓库 manifest 声称验证到了什么**
+> 3. **channel-web 当前展示了什么**
+> 4. **平台官方实际上要求什么**
+> 5. **哪些仍必须 live verification**
+
+## 1. 必须遵循的事实优先级
+
+核验时不要把所有来源混成一个“事实”。
+
+### 1.1 DSH 实现事实
+
+按以下顺序读取：
+
+1. `packages/channel-*/src/definition.ts`
+   - Web/Control Plane 暴露哪些 setup 字段
+   - 哪些字段是 secret
+   - auth method 是 credentials / device / hybrid / qr
+2. `packages/channel-*/src/config.ts`
+   - 完整配置结构、默认值、credential ref
+3. `packages/channel-*/src/adapter.ts`
+   - 对 Channel Contract 声明的真实 capability
+4. `packages/channel-*/src/upstream*` / `sdk-client.ts` / `official-upstream.ts`
+   - 真实调用的平台接口
+5. `packages/channel-*/src/manifest.ts`
+   - 上游 reference、testedVersion、strategy、status
+6. `packages/channel-web/src/client/channelRegistry.ts`
+   - **仅视为 UI presentation metadata**
+   - 绝不能把这里的 permissions 当作平台已授权/已检测事实
+
+### 1.2 平台权限事实
+
+平台权限、scope、intent、管理员权限以**当前官方平台文档/官方 SDK**为准。
+
+> **代码调用什么 API** 与 **平台允许这个 App/Bot 调什么 API** 是两件事。
+
+### 1.3 验证等级
+
+每个结论必须标记成以下一种：
+
+- `CODE-CONFIRMED`：当前 DSH 代码直接确认
+- `OFFICIAL-CONFIRMED`：当前平台官方文档/官方 SDK 确认
+- `LIVE-REQUIRED`：必须真实账号/真实应用验证
+- `DRIFT`：代码、manifest、UI 或官方平台之间已出现版本/能力漂移
+- `UNKNOWN`：没有足够权威证据，禁止猜
+
+---
+
+## 2. 当前架构基线
+
+当前 monorepo 的核心分层：
+
+```text
+DeepSeek Harness / Cordis
+        │
+        ├─ channel-harness       # 唯一 Harness Agent / Session API 边界
+        │
+        └─ channel-core          # 稳定 Channel Contract + ChannelService
+                 │
+                 ├─ channel-control   # setup / credential / auth / runtime mount
+                 ├─ channel-web       # 通用 Web 设置面板
+                 ├─ channel-files     # 通用附件扩展
+                 │
+                 └─ channel adapters
+                    ├─ channel-weixin
+                    ├─ channel-qq
+                    ├─ channel-dingtalk
+                    ├─ channel-lark
+                    └─ channel-telegram
+                              │
+                              └─ SDK / OpenAPI / source-port / protocol
+
+@wsz987/dsh-channels = 产品 Bundle，只负责一次性安装/组合，不直接实现平台协议。
+```
+
+### 架构红线
+
+后续 AI 修改时必须保持：
+
+- `channel-core` 不得出现 `if (channel === 'xxx')`
+- adapter 不得访问 `ctx.agents`
+- `channel-harness` 不得 import 平台 SDK
+- root bundle 不得直接调用平台 SDK
+- 不得自动追 SDK / upstream `latest`
+- raw platform payload 不得直接进入模型
+- 浏览器不得接触 secret / token / deviceCode / providerState
+- adapter 不得直接读写 Harness persistence
+- `channel-web` 不得维护平台业务分支；平台差异只允许落在 registry presentation metadata 或 ChannelDefinition
+
+---
+
+## 3. 当前渠道总览
+
+详细字段见 [`references/channel-matrix.md`](references/channel-matrix.md)。
+
+| 渠道 | DSH 包 | 上游策略 | 当前基线 | manifest 状态 | Setup/Auth | 主要能力 |
+|---|---|---|---|---|---|---|
+| Weixin | `@wsz987/channel-weixin` | Tencent iLink `source-port` | upstream fixture `2.4.6`，manifest live pin 待完成 | `experimental` | 无 setup 字段；QR | text/image；buffered |
+| QQ | `@wsz987/channel-qq` | Tencent 官方 SDK | `@tencent-connect/qqbot-nodejs@1.0.4` | `tested`* | AppID + AppSecret | text/image/file/audio/video；C2C native stream |
+| DingTalk | `@wsz987/channel-dingtalk` | 官方 Stream SDK + OpenAPI | `dingtalk-stream@2.1.5` | `tested`* | ClientID + ClientSecret；device/credentials | text/image/file/audio/cards；edit stream |
+| Lark/Feishu | `@wsz987/channel-lark` | 官方 Node SDK | `@larksuiteoapi/node-sdk@1.73.1` | `tested`* | AppID + AppSecret；credentials/hybrid | text/image/file/audio/cards/reactions/threads/interactive actions；edit stream |
+| Telegram | `@wsz987/channel-telegram` | Bot API HTTP 直连 + `@grammyjs/types` | manifest `Bot API >=10.2` | `experimental` | Bot token | text/image/file/audio/video/threads；Rich Markdown；DM draft/group edit stream；callback actions |
+
+\* `tested` 当前主要指 contract/fixture/offline SDK tests 已通过；**不等于真实平台权限与账号 live gate 已通过**。
+
+---
+
+## 4. Secret 与配置规则
+
+### 通用规则
+
+AI 修改任何渠道时：
+
+1. Secret **不能**写入 profile/YAML/git fixture/log/error/browser DTO。
+2. config 只保存 credential reference。
+3. secret 由 credentials/secrets seam 在 runtime resolve。
+4. `ConfiguredState` 只能返回：
+   - secret 是否 configured
+   - writable/source
+   - **不能返回 secret value**
+5. 老 plaintext 字段只能用于一次性 migration，不得成为新配置写入路径。
+
+### 当前 secret ref
+
+| 渠道 | Web setup secret | Config ref | 默认 credential ref |
+|---|---|---|---|
+| DingTalk | `clientSecret` | `upstream.clientSecretRef` | `DSH_CHANNEL_DINGTALK_MAIN_CLIENT_SECRET` |
+| Lark | `appSecret` | `upstream.appSecretRef` | `DSH_CHANNEL_LARK_MAIN_APP_SECRET` |
+| QQ | `appSecret` | `appSecretRef` | `QQBOT_APP_SECRET` |
+| Telegram | `token` | `tokenRef` | `TELEGRAM_BOT_TOKEN` |
+| Weixin | 无 Web secret 字段 | QR 登录后写 SecretStore | `weixin:token:<accountId>` |
+
+Weixin 的非 secret 登录元数据单独存储为：
+
+```text
+weixin:credential:<accountId>
+  - ilinkBotId
+  - userId?
+  - baseUrl
+  - savedAt
+```
+
+---
+
+## 5. channel-web 平台权限展示
+
+当前 Web 不展示平台权限状态。原 `ChannelPermissions.tsx` 与
+`channelRegistry.permissions` 只包含静态 presentation metadata，没有平台
+permission probe，已从 UI 和 registry 删除。
+
+设置页不得用静态绿色勾暗示平台 scope、Bot intent、事件订阅、应用发布或真实消息
+收发已经验证。平台配置要求继续由 README、本 Skill 的平台矩阵与官方平台文档说明；
+`channelRegistry.docsUrl` 只提供官方资料入口，不表示任何授权状态。
+
+### 建议后续架构
+
+如果未来要做到真实检测，应该引入通用 contract，例如：
+
+```ts
+interface ChannelPermissionStatus {
+  id: string;
+  state: 'granted' | 'missing' | 'unknown' | 'not-applicable';
+  required: boolean;
+  source?: 'platform-api' | 'runtime-probe' | 'static';
+  detail?: string;
+}
+```
+
+由各 `ChannelDefinition` / provider-specific permission checker 返回，Web 只渲染通用 DTO。
+
+**不要**在 `channel-web` 写：
+
+```ts
+if (channelId === 'lark') ...
+if (channelId === 'qq') ...
+```
+
+---
+
+## 6. 各平台权限模型
+
+### 6.1 Lark / Feishu
+
+这是最明确的 scope + event subscription 模型。
+
+当前 DSH 核心消息链路至少应核验：
+
+```text
+应用能力：
+- 机器人
+
+Tenant / 应用身份权限：
+- im:message.p2p_msg:readonly
+- im:message.group_at_msg:readonly
+- im:message:send_as_bot
+
+事件：
+- im.message.receive_v1
+- card.action.trigger
+```
+
+当前实现还使用（官方 OpenAPI / CardKit 2.0）：
+
+```text
+im.v1.image.create
+im.v1.file.create
+im.v1.message.patch       # 重写已发送的交互卡片（非流式）
+im.v1.messageResource.get # 入站资源下载（media port）
+cardkit.v1.card.create        # Card JSON 2.0 卡片实体
+cardkit.v1.card.settings      # 关闭 streaming_mode + summary
+cardkit.v1.cardElement.content# 原生流式打字机更新
+message reaction add/remove（Typing）
+```
+
+> 卡片/流式已收敛为官方 CardKit 2.0 生命周期：创建卡片实体 → 发送卡片引用 →
+> `cardElement.content`（单调 sequence + 稳定 uuid）→ `card.settings` 关闭流式。
+> 不得用 `im.v1.message.patch` 高频全量替换冒充原生打字机流式，也不用
+> `cardkit.v1.card.idConvert` 作为主路径（官方已不推荐）。
+
+因此继续核验：
+
+- 图片/文件资源上传权限
+- CardKit 对应权限（应用身份与创建卡片实体者一致）
+- `card.typingIndicator=true` 时 reaction 相关权限
+- 如果产品需要群聊中“非 @ 消息”，需申请对应的敏感“群组全部消息”权限，而不是只依赖 `group_at_msg`
+
+权限或事件修改后还要核验应用版本是否已发布生效。
+
+### 6.2 QQ
+
+QQ 不是 Lark 那种 scope 表，核心是：
+
+```text
+AppID + AppSecret
++ Bot 平台能力
++ Gateway intents
++ 部分能力资格（例如 Markdown）
+```
+
+腾讯官方 SDK 当前定义的 intents：
+
+```text
+GUILDS
+GUILD_MEMBERS
+PUBLIC_GUILD_MESSAGES
+DIRECT_MESSAGE
+GROUP_AND_C2C
+INTERACTION
+```
+
+**CODE-CONFIRMED**：当前 DSH 已显式传入最小 intent mask：
+
+```ts
+new QQBot({
+  appId,
+  appSecret,
+  accountId,
+  markdownSupport,
+  transport: 'websocket',
+  tokenPrefetch: 'sync',
+  intents: QQ_MINIMAL_INTENTS,
+})
+```
+
+`QQ_MINIMAL_INTENTS = GROUP_AND_C2C | INTERACTION`，不再依赖 SDK 的
+`FULL_INTENTS` 默认值。真实 QQ live gate 仍需确认目标 App 已获准这两项，否则 Gateway
+可能返回 `4914 INSUFFICIENT_INTENTS` / `4915 DISALLOWED_INTENTS`。
+
+另外：
+
+- `markdownSupport=true` 只能在 QQ Bot 已获得 Markdown 平台权限时开启
+- C2C 原生 `stream_messages` 只适合当前代码的 C2C + reply message id 场景
+- 群聊当前走 buffered send，不应误标为 native streaming
+
+### 6.3 DingTalk
+
+主要模型：
+
+```text
+企业内部应用
++ ClientID(AppKey)
++ ClientSecret(AppSecret)
++ 机器人能力
++ Stream 模式 / 事件接收
++ 各 OpenAPI 对应应用权限
+```
+
+当前实际接口包括：
+
+```text
+Inbound
+- DingTalk Stream SDK
+- bot message callback / Stream connection
+
+Auth
+- POST /v1.0/oauth2/accessToken
+
+Reply
+- inbound sessionWebhook
+
+Proactive
+- POST /v1.0/robot/groupMessages/send
+- POST /v1.0/robot/oToMessages/batchSend
+
+Media
+- POST https://oapi.dingtalk.com/media/upload
+- POST /v1.0/robot/messageFiles/download
+
+AI Card
+- POST /v1.0/card/instances
+- POST /v1.0/card/instances/deliver
+- PUT  /v1.0/card/streaming
+```
+
+核验平台时不能只验证 Stream 可以收消息，还必须逐项验证：
+
+- 主动群消息
+- 主动单聊消息
+- media upload/download
+- AI Card create/deliver/streaming
+
+具体 OpenAPI 权限名称以**当次官方 API 文档的“权限要求”**为准，不要从旧博客或第三方镜像猜名字。
+
+### 6.4 Telegram
+
+Telegram Bot API 没有 Lark 风格 OAuth scope 表。
+
+主要权限/可见性来自：
+
+```text
+BotFather token
+Bot 是否在目标 chat 中
+Group Privacy Mode
+Bot 管理员权限（按操作）
+目标 chat 是否允许 Bot 发送对应消息
+```
+
+当前 DSH 使用 long polling：
+
+```text
+deleteWebhook
+getUpdates allowed_updates=['message', 'callback_query']
+```
+
+因此：
+
+- adapter 启动时会调用 `deleteWebhook` 并移除该 Bot 已配置的 webhook；同一 Bot 不得
+  同时交给其他 webhook consumer
+- 群聊如果开启 Privacy Mode，Bot 不会自动看到所有普通群消息
+- 如果产品目标是“所有群消息都进入 Agent”，必须显式核验 BotFather privacy / 管理员状态
+- 当前 20 MiB inbound download cap 与 Telegram cloud Bot API `getFile` 的 20 MB 下载限制对齐
+
+**CODE-CONFIRMED**：manifest 与 fixtures 已迁移到 **Bot API 10.2**，状态仍为
+`experimental`。Rich Message、draft streaming、callback 与 429 recovery 仍需真实 Bot live gate。
+
+**CODE-CONFIRMED**：`sendMedia()` 已校验 Bot API `ok` envelope；普通 message/update 与
+callback payload 已经过 zod trust-boundary schema；缺少 `message.chat` 的 callback query
+会 fail closed。剩余工作是真实 Bot live gate，不再有这三项离线 release blocker。
+
+### 6.5 Weixin iLink
+
+当前 Tencent iLink / `openclaw-weixin` 参考实现不是公开 OAuth scope 模型，而是：
+
+```text
+QR 登录
+  ↓
+获得 ilink bot token
+  ↓
+AuthorizationType: ilink_bot_token
+Authorization: Bearer <token>
+  ↓
+getupdates / sendmessage / getuploadurl / getconfig / sendtyping
+```
+
+当前 DSH：
+
+- Web setup fields = `[]`
+- auth method = `qr`
+- token 保存到 SecretStore
+- iLink identity/base URL 保存到 ChannelStorage
+- source-port 隔离协议/AES/CDN 细节
+- `file` capability 当前为 `false`
+- concrete upstream 的 `sendFile()` 当前明确抛 `UpstreamCapabilityError`
+
+因此：
+
+- **不要**因为 Tencent reference README 的 `sendMessage` 协议可描述 file，就把 DSH `file` capability 改成 true
+- 必须以 DSH concrete upstream 是否真正支持为准
+- 当前 manifest 仍是：
+  - `testedVersion: <pending-live-verification>`
+  - `testedCommit: <pending-live-verification>`
+  - `versionRange: '*'`
+  - `status: experimental`
+- live gate 通过后必须 pin upstream version/commit，不能长期保留 `*`
+
+---
+
+## 7. 当前优先级最高的核验发现
+
+### P0 — 平台权限状态必须来自真实检测
+
+`channel-web` 已删除静态 permission ✓。未来恢复平台权限 UI 时，状态至少区分：
+
+```text
+Required（需求说明）
+Unknown（尚未检测）
+Granted（真实检测）
+Missing（真实检测失败）
+```
+
+### CODE-CONFIRMED — QQ intents 已最小化
+
+当前 DSH 已按实际事件面显式传入：
+
+```text
+GROUP_AND_C2C | INTERACTION
+    ↓
+QQ_MINIMAL_INTENTS
+    ↓
+显式传入 QQBot；live gate 核验 App 权限
+```
+
+而不是请求所有 intents。
+
+### P1 — Telegram 10.2 实现缺口与 live gate
+
+```text
+DSH minimum:  >=10.2
+官方当前:     10.2 (2026-07-14)
+```
+
+优先执行：
+
+1. 修复 media response envelope 校验
+2. 对普通 message/update 建立完整 zod trust-boundary schema
+3. 无 `message.chat` callback fail closed
+4. real bot live verification
+5. 再评估将 status 从 `experimental` 升级
+
+### P1 — Weixin live pin 尚未完成
+
+当前：
+
+```text
+testedVersion = <pending-live-verification>
+testedCommit  = <pending-live-verification>
+versionRange  = *
+status        = experimental
+```
+
+Tencent 官方 `openclaw-weixin` 参考协议存在，但 DSH 是 source-port，必须通过真实 iLink gate 后再升级状态。
+
+### Web 官方文档入口
+
+`channelRegistry.docsUrl` 与权限状态完全分离：有配置字段的渠道在“应用配置”标题旁显示，
+微信等无配置字段但有交互授权的渠道在“授权”标题旁显示。微信当前指向腾讯官方
+`https://github.com/Tencent/openclaw-weixin`，不再使用无关的视频号入口。
+
+未来若实现真实检测，Lark 等渠道必须使用准确的 platform scope/event id，不能复用
+抽象的展示 id。
+
+---
+
+## 8. AI 后续执行流程
+
+每次用户说“核验某渠道”或“升级某 SDK”时，按以下顺序执行。
+
+### Step 1 — 锁定代码快照
+
+```text
+repo
+branch
+HEAD SHA
+HEAD date
+```
+
+如果 HEAD 与本 Skill 的 snapshot commit 不同，先标记：
+
+```text
+DRIFT: repository changed after skill snapshot
+```
+
+### Step 2 — 读取实现四件套
+
+目标渠道最少读取：
+
+```text
+definition.ts
+config.ts
+adapter.ts
+manifest.ts
+```
+
+再读取真实平台边界：
+
+```text
+sdk-client.ts
+official-upstream.ts
+openapi-outbound.ts
+upstream.ts
+source-port implementation
+```
+
+### Step 3 — 列出真实 API
+
+禁止只读 README。
+
+从代码列出：
+
+```text
+Inbound
+Outbound
+Media upload
+Media download
+Streaming
+Typing/reaction
+Auth
+Proactive send
+```
+
+### Step 4 — 对照当前官方文档
+
+只使用：
+
+- 平台官方文档
+- 平台官方 GitHub
+- 平台官方 SDK
+- 官方 npm package metadata
+
+第三方项目只能作为参考，不能用来宣布权限事实。
+
+### Step 5 — 建立 permission matrix
+
+每个 API 都回答：
+
+```text
+API/能力
+DSH 是否调用
+平台权限/intent
+是否必需
+是否可静态确认
+是否必须 live verify
+```
+
+### Step 6 — 对照 channel-web
+
+检查：
+
+- setup fields 是否与 ChannelDefinition 一致
+- secret 是否仅由 credentials endpoint 写入
+- permission copy 是否准确
+- docsUrl 是否仍有效
+- 是否误显示“已授权”
+- auth prerequisite 是否匹配
+
+### Step 7 — 对照 manifest
+
+检查：
+
+```text
+reference
+strategy
+sdk package
+testedVersion
+versionRange
+status
+lastVerifiedDate
+```
+
+禁止：
+
+```text
+看到 upstream 有最新版 → 直接升级 latest
+```
+
+### Step 8 — 输出差异
+
+固定输出：
+
+```text
+Architecture
+Setup/Credentials
+API Surface
+Permissions
+Upstream Drift
+Web UI Drift
+Live Verification
+Recommended Changes
+```
+
+---
+
+## 9. 发布/升级判断规则
+
+### 可以标 `tested` 的最低标准
+
+不能只因为 unit tests 通过。
+
+至少应区分：
+
+```text
+offline-tested
+live-tested
+```
+
+如果 manifest schema 暂时只有 `tested/experimental`，文档必须写明 live gate 状态。
+
+### 不允许自动升级 upstream
+
+任何升级都要：
+
+```text
+pin candidate version
+→ compare upstream changelog/source
+→ update fixtures
+→ contract tests
+→ adapter tests
+→ live platform gate
+→ update manifest
+```
+
+---
+
+## 10. 输出模板
+
+后续 AI 核验渠道时建议使用：
+
+```markdown
+## <Channel> verification
+
+Snapshot:
+- DSH: <sha>
+- Upstream: <version>
+- Official docs checked: <date>
+
+### Architecture
+...
+
+### Setup / credentials
+...
+
+### Actual APIs
+...
+
+### Required platform permissions
+| API | permission / intent | required | evidence | live |
+|---|---|---|---|---|
+
+### Drift
+- ...
+
+### Result
+- CODE-CONFIRMED:
+- OFFICIAL-CONFIRMED:
+- LIVE-REQUIRED:
+- DRIFT:
+
+### Changes
+- P0:
+- P1:
+- P2:
+```
+
+---
+
+## 11. 本快照结论
+
+当前架构方向是合理且已经比较收敛的：
+
+```text
+Stable Core
++ generic Control Plane
++ generic Web
++ per-channel Definition
++ isolated upstream driver
++ credential seam
++ compatibility manifest
+```
+
+这次核验最重要的不是再拆包，而是把 **“权限与 live verification”** 做成真正的一等治理对象。
+
+优先顺序：
+
+1. 保持 `channel-web` 不展示静态 permission 状态；恢复前先实现真实 permission checker
+2. QQ 用真实 App 完成最小 intents live gate
+3. Telegram 完成 Bot API 10.2 真实 Bot live gate
+4. Weixin 完成真实 iLink live gate 并 pin version/commit
+5. Lark/DingTalk 把真实平台 permission/event/API 要求整理成机器可读 metadata，未来再接真实 permission checker
+
+详细矩阵与官方来源见 `references/`。

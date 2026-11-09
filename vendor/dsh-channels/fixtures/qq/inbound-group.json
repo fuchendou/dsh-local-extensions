@@ -1,0 +1,47 @@
+{
+  "name": "inbound group text message",
+  "channel": "qq",
+  "upstreamVersion": "1.0.4",
+  "payload": {
+    "rawEventType": "GROUP_AT_MESSAGE_CREATE",
+    "kind": "group",
+    "senderId": "user_321",
+    "senderName": "bob",
+    "senderIsBot": false,
+    "content": "hello group",
+    "messageId": "msg_grp_1",
+    "timestamp": "2026-08-14T10:01:00+08:00",
+    "groupOpenid": "group_789",
+    "attachments": [],
+    "replyTarget": { "scope": "group", "targetId": "group_789", "msgId": "msg_grp_1" },
+    "raw": {
+      "id": "msg_grp_1",
+      "content": "hello group",
+      "timestamp": "2026-08-14T10:01:00+08:00",
+      "author": { "member_openid": "user_321", "username": "bob" },
+      "group_id": "123456789",
+      "group_openid": "group_789"
+    }
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "qq",
+    "accountId": "main",
+    "conversation": { "id": "group_789", "type": "group" },
+    "sender": { "id": "user_321", "name": "bob" },
+    "message": {
+      "id": "msg_grp_1",
+      "content": [{ "type": "text", "text": "hello group" }],
+      "activation": { "mentionedBot": true },
+      "createdAt": 1786672860000
+    },
+    "raw": {
+      "id": "msg_grp_1",
+      "content": "hello group",
+      "timestamp": "2026-08-14T10:01:00+08:00",
+      "author": { "member_openid": "user_321", "username": "bob" },
+      "group_id": "123456789",
+      "group_openid": "group_789"
+    }
+  }
+}

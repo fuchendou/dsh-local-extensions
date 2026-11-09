@@ -1,0 +1,41 @@
+{
+  "name": "inbound text (iLink)",
+  "channel": "weixin",
+  "upstreamVersion": "ilink",
+  "payload": {
+    "message_id": 1001,
+    "from_user_id": "user_123",
+    "to_user_id": "bot_abc",
+    "create_time_ms": 1700000000000,
+    "item_list": [
+      {
+        "type": 1,
+        "text_item": {
+          "text": "hello harness"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "weixin",
+    "accountId": "main",
+    "conversation": {
+      "id": "user_123",
+      "type": "dm"
+    },
+    "sender": {
+      "id": "user_123"
+    },
+    "message": {
+      "id": "wx-1001",
+      "content": [
+        {
+          "type": "text",
+          "text": "hello harness"
+        }
+      ],
+      "createdAt": 1700000000000
+    }
+  }
+}

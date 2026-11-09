@@ -1,0 +1,43 @@
+{
+  "name": "callback query interaction in a forum topic",
+  "channel": "telegram",
+  "upstreamVersion": "10.2",
+  "payload": {
+    "update_id": 2002,
+    "callback_query": {
+      "id": "callback_query_id_forum_123",
+      "from": {
+        "id": 100200300,
+        "first_name": "Alice",
+        "is_bot": false
+      },
+      "message": {
+        "message_id": 778,
+        "message_thread_id": 123,
+        "chat": {
+          "id": -1002003004005,
+          "type": "supergroup",
+          "title": "Proof Forum"
+        }
+      },
+      "chat_instance": "forum_chat_instance_token",
+      "data": "dshq:forum-token:0:1"
+    }
+  },
+  "expected": {
+    "type": "interaction.received",
+    "channel": "telegram",
+    "accountId": "main",
+    "conversation": {
+      "id": "-1002003004005",
+      "type": "group",
+      "threadId": "123"
+    },
+    "sender": {
+      "id": "100200300",
+      "name": "Alice"
+    },
+    "interactionId": "callback_query_id_forum_123",
+    "action": "dshq:forum-token:0:1"
+  }
+}

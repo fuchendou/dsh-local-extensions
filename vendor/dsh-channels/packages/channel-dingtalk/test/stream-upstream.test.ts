@@ -1,0 +1,569 @@
+/**
+ * SDK upstream driver tests (offline, fake stream client).
+ *
+ * Covers the `DingTalkStreamUpstream` inbound path: listener registration,
+ * SDK message → gateway raw shape mapping, the full inbound pipeline to a
+ * MessageReceived, abort-driven teardown, outbound delegation to the HTTP
+ * transport, and the credentials-never-leak guarantee. No real WebSocket or
+ * DingTalk credentials are involved.
+ */
+import { describe, expect, it, vi } from 'vitest';
+import { Context } from '@deepseek-ai/cordis';
+import { TOPIC_CARD, TOPIC_ROBOT } from 'dingtalk-stream';
+import { ChannelService, ChannelError, type MessageReceived } from '@wsz987/channel-core';
+import { createTestContext, makeChannelTarget } from '@wsz987/channel-testkit';
+import {
+  DingTalkStreamUpstream,
+  HttpDingTalkUpstream,
+  InboundProcessor,
+  ackRobotMessage,
+  toCardInteractionRaw,
+  toGatewayRaw,
+} from '../src/index.ts';
+import type { DingTalkStreamClient, DingTalkStreamMessage } from '../src/index.ts';
+import type { HttpTransport, HttpRequestInit } from '../src/index.ts';
+import type { CardCreateResult, DingTalkUpstream } from '../src/index.ts';
+
+/** Deterministic fake transport: routes keyed by path, records calls. */
+class FakeTransport implements HttpTransport {
+  routes = new Map<string, (init?: HttpRequestInit, signal?: AbortSignal) => unknown>();
+  calls: { path: string; init?: HttpRequestInit }[] = [];
+
+  route(path: string, handler: (init?: HttpRequestInit, signal?: AbortSignal) => unknown): this {
+    this.routes.set(path, handler);
+    return this;
+  }
+
+  request(path: string, init: HttpRequestInit = {}, signal?: AbortSignal): Promise<unknown> {
+    this.calls.push({ path, init });
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    }
+    const handler = this.routes.get(path);
+    if (!handler) return Promise.reject(new ChannelError('CHANNEL_ERROR', `no route for ${path}`));
+    try {
+      return Promise.resolve(handler(init, signal));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+}
+
+/** Trivial outbound delegate for receive-focused tests. */
+class FakeOutbound implements DingTalkUpstream {
+  receive(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  sendText(): Promise<unknown> {
+    return Promise.resolve({});
+  }
+
+  createCard(): Promise<CardCreateResult> {
+    return Promise.resolve({ cardId: 'fake-card' });
+  }
+
+  updateCard(): Promise<unknown> {
+    return Promise.resolve({});
+  }
+
+  finishCard(): Promise<unknown> {
+    return Promise.resolve({});
+  }
+
+  failCard(): Promise<unknown> {
+    return Promise.resolve({});
+  }
+}
+
+/** Fake stream client: records lifecycle, dispatches inbound messages. */
+class FakeStreamClient implements DingTalkStreamClient {
+  connects = 0;
+  disconnects = 0;
+  readonly registered: string[] = [];
+  readonly calls: unknown[] = [];
+  /** Recorded `socketCallBackResponse` invocations: `{ messageId, response }`. */
+  readonly acks: { messageId: string; response: unknown }[] = [];
+  failConnect?: Error;
+  private readonly listeners = new Map<string, (message: DingTalkStreamMessage) => void | Promise<void>>();
+
+  connect(): Promise<void> {
+    this.calls.push(['connect']);
+    if (this.failConnect) {
+      const error = this.failConnect;
+      this.failConnect = undefined;
+      return Promise.reject(error);
+    }
+    this.connects += 1;
+    return Promise.resolve();
+  }
+
+  disconnect(): void {
+    this.calls.push(['disconnect']);
+    this.disconnects += 1;
+  }
+
+  registerCallbackListener(topic: string, callback: (message: DingTalkStreamMessage) => void | Promise<void>): this {
+    this.calls.push(['registerCallbackListener', topic]);
+    this.registered.push(topic);
+    this.listeners.set(topic, callback);
+    return this;
+  }
+
+  socketCallBackResponse(messageId: string, response: unknown): void {
+    this.calls.push(['socketCallBackResponse', messageId]);
+    this.acks.push({ messageId, response });
+  }
+
+  /** Simulate the stream server delivering a CALLBACK message on a topic. */
+  emit(topic: string, message: DingTalkStreamMessage): void {
+    void this.listeners.get(topic)?.(message);
+  }
+}
+
+/** Build a downstream message carrying a robot message payload. */
+function robotDownstream(overrides: Record<string, unknown> = {}): DingTalkStreamMessage {
+  return {
+    headers: { topic: TOPIC_ROBOT, eventId: 'evt-1', messageId: 'mid-1' },
+    data: JSON.stringify({
+      msgId: 'msg-1',
+      senderStaffId: 'user_123',
+      conversationId: 'conv_456',
+      msgtype: 'text',
+      text: { content: 'hello sdk' },
+      ...overrides,
+    }),
+  };
+}
+
+function streamUpstream(client: DingTalkStreamClient, outbound: DingTalkUpstream): DingTalkStreamUpstream {
+  return new DingTalkStreamUpstream({ client, outbound });
+}
+
+describe('toGatewayRaw (SDK message → gateway raw shape)', () => {
+  it('preserves the official isInAtList activation fact', () => {
+    const mentioned = toGatewayRaw(robotDownstream({ isInAtList: true }));
+    expect(mentioned).toMatchObject({ mentionedBot: true });
+
+    const unmentioned = toGatewayRaw(robotDownstream({ isInAtList: false }));
+    expect(unmentioned).toMatchObject({ mentionedBot: false });
+
+    const absent = toGatewayRaw(robotDownstream({ isInAtList: 'true' }));
+    expect(absent).toBeUndefined();
+  });
+
+  it('maps a text robot message to the gateway raw shape', () => {
+    const raw = toGatewayRaw(robotDownstream({
+      conversationType: '2',
+      sessionWebhook: 'https://example.dingtalk.com/session/reply',
+      robotCode: 'ding-app',
+    }));
+    expect(raw).toEqual({
+      type: 'text',
+      msgId: 'msg-1',
+      eventId: 'evt-1',
+      senderId: 'user_123',
+      conversationId: 'conv_456',
+      conversationType: '2',
+      sessionWebhook: 'https://example.dingtalk.com/session/reply',
+      robotCode: 'ding-app',
+      content: 'hello sdk',
+    });
+  });
+
+  it('maps media messages best-effort (picture/audio/file)', () => {
+    const picture = toGatewayRaw(
+      robotDownstream({ msgtype: 'picture', picture: { url: 'https://example.com/p.png' } }),
+    );
+    expect(picture).toMatchObject({ type: 'picture', picUrl: 'https://example.com/p.png' });
+
+    const audio = toGatewayRaw(
+      robotDownstream({ msgtype: 'audio', audio: { duration: 5200, url: 'https://example.com/a.amr' } }),
+    );
+    expect(audio).toMatchObject({ type: 'audio', mediaUrl: 'https://example.com/a.amr', durationMs: 5200 });
+
+    const file = toGatewayRaw(
+      robotDownstream({ msgtype: 'file', file: { fileName: 'report.pdf', url: 'https://example.com/r.pdf' } }),
+    );
+    expect(file).toMatchObject({ type: 'file', mediaUrl: 'https://example.com/r.pdf', title: 'report.pdf' });
+  });
+
+  it('maps official media content (content.downloadCode) for picture/file/audio (M2A fix)', () => {
+    // The real robot callback carries media content in `content` (object or
+    // JSON string) with the actionable `downloadCode` — oracle: official
+    // connector message-handler. picMediaId/pictureUrl are optional extras.
+    const picture = toGatewayRaw(
+      robotDownstream({
+        msgtype: 'picture',
+        content: { picMediaId: '@lADP_1', downloadCode: 'dl-pic', pictureUrl: 'https://cdn.example/p.png' },
+      }),
+    );
+    expect(picture).toMatchObject({
+      type: 'picture',
+      picMediaId: '@lADP_1',
+      picDownloadCode: 'dl-pic',
+      picUrl: 'https://cdn.example/p.png',
+    });
+
+    const file = toGatewayRaw(
+      robotDownstream({ msgtype: 'file', content: { fileName: 'a.pdf', downloadCode: 'dl-file' } }),
+    );
+    expect(file).toMatchObject({ type: 'file', title: 'a.pdf', downloadCode: 'dl-file' });
+
+    const audio = toGatewayRaw(
+      robotDownstream({ msgtype: 'audio', content: JSON.stringify({ duration: 3300, downloadCode: 'dl-audio' }) }),
+    );
+    expect(audio).toMatchObject({ type: 'audio', durationMs: 3300, downloadCode: 'dl-audio' });
+  });
+
+  it('maps current and legacy richText image structures', () => {
+    const current = toGatewayRaw(robotDownstream({
+      msgtype: 'richText',
+      content: {
+        richText: [
+          { type: 'text', text: 'before ' },
+          { type: 'picture', pictureUrl: 'https://cdn.example/a.png' },
+          { type: 'picture', downloadCode: 'dl-rich-1' },
+        ],
+      },
+    }));
+    expect(current).toMatchObject({
+      type: 'richText',
+      content: 'before ',
+      richTextImages: [
+        { pictureUrl: 'https://cdn.example/a.png' },
+        { downloadCode: 'dl-rich-1' },
+      ],
+    });
+
+    const legacy = toGatewayRaw(robotDownstream({
+      msgtype: 'richText',
+      content: undefined,
+      richText: { richTextList: [{ pictureUrl: 'https://cdn.example/legacy.jpg' }] },
+    }));
+    expect(legacy).toMatchObject({
+      type: 'richText',
+      richTextImages: [{ pictureUrl: 'https://cdn.example/legacy.jpg' }],
+    });
+  });
+
+  it('falls back to senderId when senderStaffId is absent', () => {
+    const raw = toGatewayRaw(robotDownstream({ senderStaffId: undefined, senderId: 'fallback-user' }));
+    expect(raw).toMatchObject({ senderId: 'fallback-user' });
+  });
+
+  it('returns undefined for absent or non-JSON payloads', () => {
+    expect(toGatewayRaw({ headers: { topic: TOPIC_ROBOT } })).toBeUndefined();
+    expect(toGatewayRaw({ headers: { topic: TOPIC_ROBOT }, data: 'not-json' })).toBeUndefined();
+  });
+});
+
+describe('toCardInteractionRaw (interactive card callback)', () => {
+  it('maps the official card callback action params', () => {
+    const raw = toCardInteractionRaw({
+      headers: { topic: TOPIC_CARD, eventId: 'evt-card-1', messageId: 'mid-card-1' },
+      data: JSON.stringify({
+        outTrackId: 'question-1',
+        userId: 'user-1',
+        openConversationId: 'cid-1',
+        cardActionData: { cardPrivateData: { params: { action: 'continue' } } },
+      }),
+    });
+    expect(raw).toEqual({
+      type: 'interaction',
+      msgId: 'mid-card-1',
+      eventId: 'evt-card-1',
+      senderId: 'user-1',
+      conversationId: 'cid-1',
+      conversationType: '2',
+      interactionId: 'question-1',
+      action: 'continue',
+      value: { action: 'continue' },
+    });
+  });
+
+  it('rejects malformed callbacks and callbacks without an action id', () => {
+    expect(toCardInteractionRaw({ data: 'not-json' })).toBeUndefined();
+    expect(toCardInteractionRaw({ data: JSON.stringify({ outTrackId: 'x', userId: 'u' }) })).toBeUndefined();
+  });
+});
+
+describe('DingTalkStreamUpstream.receive', () => {
+  it('registers the robot topic listener and connects, then disconnects on abort', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const received: unknown[] = [];
+    const loop = upstream.receive(controller.signal, (raw) => received.push(raw));
+
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    expect(client.registered).toEqual([TOPIC_ROBOT, TOPIC_CARD]);
+
+    client.emit(TOPIC_ROBOT, robotDownstream());
+    await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 2000 });
+    expect(received[0]).toMatchObject({
+      type: 'text',
+      msgId: 'msg-1',
+      senderId: 'user_123',
+      conversationId: 'conv_456',
+      content: 'hello sdk',
+    });
+    expect(received[0]).toHaveProperty('eventId', 'evt-1');
+
+    controller.abort();
+    await loop;
+    expect(client.disconnects).toBe(1);
+  });
+
+  it('routes inbound robot messages through the inbound processor to MessageReceived', async () => {
+    const service = new ChannelService(new Context());
+    const ctx = createTestContext(service);
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const processor = new InboundProcessor({
+      ctx,
+      meta: { channel: 'dingtalk' as never, accountId: 'main' as never },
+      dedupEnabled: false,
+      dedupWindowMs: 5000,
+    });
+    const listener = vi.fn();
+    service.on(listener);
+    const controller = new AbortController();
+    const loop = upstream.receive(controller.signal, (raw) => {
+      void processor.handle(raw).catch(() => undefined);
+    });
+
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    client.emit(TOPIC_ROBOT, robotDownstream());
+    await vi.waitFor(
+      () => {
+        const events = listener.mock.calls.map((call) => call[0] as MessageReceived);
+        expect(events.some((event) => event.type === 'message.received')).toBe(true);
+      },
+      { timeout: 2000 },
+    );
+    const event = listener.mock.calls
+      .map((call) => call[0] as MessageReceived)
+      .find((candidate) => candidate.type === 'message.received')!;
+    expect(event.message.id).toBe('msg-1');
+    expect(event.message.content).toEqual([{ type: 'text', text: 'hello sdk' }]);
+    expect(event.conversation.id).toBe('conv_456');
+    expect(event.sender.id).toBe('user_123');
+
+    controller.abort();
+    await loop;
+  });
+
+  it('resolves on abort and disconnects', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const loop = upstream.receive(controller.signal, () => {});
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    controller.abort();
+    await loop; // must resolve, not hang
+    expect(client.disconnects).toBe(1);
+  });
+
+  it('disconnects without onConnected when the signal aborts mid-connect', async () => {
+    const client = new FakeStreamClient();
+    const connected = vi.fn();
+    const upstream = new DingTalkStreamUpstream({ client, outbound: new FakeOutbound(), onConnected: connected });
+    const controller = new AbortController();
+    const loop = upstream.receive(controller.signal, () => {});
+    // Abort before connect resolves.
+    controller.abort();
+    await loop;
+    expect(client.disconnects).toBe(1);
+    expect(connected).not.toHaveBeenCalled();
+  });
+
+  it('propagates connect failures (adapter owns reconnect)', async () => {
+    const client = new FakeStreamClient();
+    client.failConnect = new Error('stream connect failed');
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    await expect(upstream.receive(controller.signal, () => {})).rejects.toThrow('stream connect failed');
+    expect(client.disconnects).toBe(0);
+  });
+
+  it('reconnects without re-registering the topic listener', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const first = new AbortController();
+    await (async () => {
+      const loop = upstream.receive(first.signal, () => {});
+      await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+      first.abort();
+      await loop;
+    })();
+    const second = new AbortController();
+    const loop = upstream.receive(second.signal, () => {});
+    await vi.waitFor(() => expect(client.connects).toBe(2), { timeout: 2000 });
+    expect(client.registered).toEqual([TOPIC_ROBOT, TOPIC_CARD]); // registered once
+    second.abort();
+    await loop;
+    expect(client.disconnects).toBe(2);
+  });
+});
+
+describe('DingTalkStreamUpstream ACK (socketCallBackResponse)', () => {
+  it('submits and acknowledges a valid card callback', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const received: unknown[] = [];
+    const loop = upstream.receive(controller.signal, (raw) => received.push(raw));
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+
+    client.emit(TOPIC_CARD, {
+      headers: { topic: TOPIC_CARD, messageId: 'mid-card-1' },
+      data: JSON.stringify({
+        outTrackId: 'question-1',
+        userId: 'user-1',
+        openConversationId: 'cid-1',
+        cardActionData: { cardPrivateData: { params: { action: 'continue' } } },
+      }),
+    });
+    await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 2000 });
+    expect(client.acks).toContainEqual({ messageId: 'mid-card-1', response: { success: true } });
+
+    controller.abort();
+    await loop;
+  });
+
+  it('does not acknowledge a malformed card callback', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const loop = upstream.receive(controller.signal, () => {});
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+
+    client.emit(TOPIC_CARD, {
+      headers: { topic: TOPIC_CARD, messageId: 'mid-card-bad' },
+      data: JSON.stringify({ outTrackId: 'question-1', userId: 'user-1' }),
+    });
+    expect(client.acks).toHaveLength(0);
+
+    controller.abort();
+    await loop;
+  });
+
+  it('acks a valid robot message exactly once after submission', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const received: unknown[] = [];
+    const loop = upstream.receive(controller.signal, (raw) => received.push(raw));
+
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    client.emit(TOPIC_ROBOT, robotDownstream());
+    await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 2000 });
+
+    expect(received).toHaveLength(1);
+    expect(client.acks).toEqual([{ messageId: 'mid-1', response: { success: true } }]);
+    expect(client.calls.filter((c) => c[0] === 'socketCallBackResponse')).toHaveLength(1);
+
+    controller.abort();
+    await loop;
+  });
+
+  it('does not ack a malformed (non-JSON) payload', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const received: unknown[] = [];
+    const loop = upstream.receive(controller.signal, (raw) => received.push(raw));
+
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    client.emit(TOPIC_ROBOT, { headers: { topic: TOPIC_ROBOT, messageId: 'mid-bad' }, data: 'not-json' });
+    await vi.waitFor(() => expect(client.calls.some((c) => c[0] === 'socketCallBackResponse')).toBe(false), { timeout: 2000 });
+
+    expect(received).toHaveLength(0);
+    expect(client.acks).toHaveLength(0);
+
+    controller.abort();
+    await loop;
+  });
+
+  it('does not ack a frame without a server messageId', () => {
+    const client = new FakeStreamClient();
+    ackRobotMessage(client, { headers: { topic: TOPIC_ROBOT }, data: '{}' });
+    expect(client.acks).toHaveLength(0);
+  });
+
+  it('acks each redelivery independently (dedup is a separate inbound layer)', async () => {
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, new FakeOutbound());
+    const controller = new AbortController();
+    const received: unknown[] = [];
+    const loop = upstream.receive(controller.signal, (raw) => received.push(raw));
+
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    client.emit(TOPIC_ROBOT, robotDownstream());
+    client.emit(TOPIC_ROBOT, robotDownstream());
+    await vi.waitFor(() => expect(received).toHaveLength(2), { timeout: 2000 });
+
+    expect(client.acks.map((a) => a.messageId)).toEqual(['mid-1', 'mid-1']);
+
+    controller.abort();
+    await loop;
+  });
+});
+
+describe('DingTalkStreamUpstream outbound (delegated to the HTTP driver)', () => {
+  it('posts sendText through the HTTP transport with the gateway payload', async () => {
+    const transport = new FakeTransport();
+    transport.route('/message/send', () => ({ id: 'out-1' }));
+    const http = new HttpDingTalkUpstream({ transport, longPollTimeoutMs: 1000 });
+    const upstream = streamUpstream(new FakeStreamClient(), http);
+
+    const result = await upstream.sendText({ ...makeChannelTarget(), conversationId: 'conv_456' as never }, 'hello');
+    expect(result).toEqual({ id: 'out-1' });
+    const call = transport.calls.find((c) => c.path === '/message/send');
+    expect(call?.init?.body).toEqual({ to: 'conv_456', type: 'text', content: 'hello' });
+  });
+
+  it('delegates card operations to the outbound upstream', async () => {
+    const transport = new FakeTransport();
+    transport.route('/card/create', () => ({ cardId: 'card-1' }));
+    transport.route('/card/update', () => ({ ok: true }));
+    transport.route('/card/finish', () => ({ ok: true }));
+    transport.route('/card/fail', () => ({ ok: true }));
+    const http = new HttpDingTalkUpstream({ transport, longPollTimeoutMs: 1000 });
+    const upstream = streamUpstream(new FakeStreamClient(), http);
+
+    await expect(upstream.createCard({ ...makeChannelTarget(), conversationId: 'conv_456' as never }, 'hi')).resolves.toEqual({ cardId: 'card-1' });
+    await upstream.updateCard('card-1', 'hi 2');
+    await upstream.finishCard('card-1');
+    await upstream.failCard('card-1', 'boom');
+    expect(transport.calls.map((c) => c.path)).toEqual([
+      '/card/create',
+      '/card/update',
+      '/card/finish',
+      '/card/fail',
+    ]);
+  });
+
+  it('never leaks credentials into recorded calls or errors', async () => {
+    const secret = 'super-secret-app-secret';
+    const transport = new FakeTransport();
+    transport.route('/message/send', () => {
+      throw new Error('outbound exploded');
+    });
+    const http = new HttpDingTalkUpstream({ transport, longPollTimeoutMs: 1000 });
+    const client = new FakeStreamClient();
+    const upstream = streamUpstream(client, http);
+
+    // Drive one full receive cycle so the client records its calls.
+    const controller = new AbortController();
+    const loop = upstream.receive(controller.signal, () => {});
+    await vi.waitFor(() => expect(client.connects).toBe(1), { timeout: 2000 });
+    controller.abort();
+    await loop;
+
+    await expect(upstream.sendText({ ...makeChannelTarget(), conversationId: 'conv_456' as never }, 'hi')).rejects.toThrow('outbound exploded');
+    expect(JSON.stringify(client.calls)).not.toContain(secret);
+    expect(JSON.stringify(transport.calls)).not.toContain(secret);
+  });
+});

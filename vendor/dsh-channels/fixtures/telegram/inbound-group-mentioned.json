@@ -1,0 +1,56 @@
+{
+  "name": "inbound group message mentioning bot after surrogate pair",
+  "channel": "telegram",
+  "upstreamVersion": "10.2",
+  "payload": {
+    "update_id": 1011,
+    "message": {
+      "message_id": 511,
+      "date": 1700000010,
+      "chat": {
+        "id": -100200300,
+        "type": "supergroup",
+        "title": "Harness Lab"
+      },
+      "from": {
+        "id": 400500600,
+        "is_bot": false,
+        "first_name": "Alice",
+        "username": "alice_user"
+      },
+      "text": "😀 @Proof_Bot hello",
+      "entities": [
+        {
+          "type": "mention",
+          "offset": 3,
+          "length": 10
+        }
+      ]
+    }
+  },
+  "expected": {
+    "type": "message.received",
+    "channel": "telegram",
+    "accountId": "main",
+    "conversation": {
+      "id": "-100200300",
+      "type": "group"
+    },
+    "sender": {
+      "id": "400500600",
+      "name": "Alice"
+    },
+    "message": {
+      "id": "511",
+      "content": [
+        {
+          "type": "text",
+          "text": "😀 @Proof_Bot hello"
+        }
+      ],
+      "activation": {
+        "mentionedBot": true
+      }
+    }
+  }
+}

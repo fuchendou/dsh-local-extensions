@@ -1,0 +1,173 @@
+/**
+ * Channel command plane.
+ *
+ * Composes the channel command factories and installs them into an Agent
+ * scoped context via the official `@deepseek-ai/dsh-commands` registry —
+ * there is no custom ChannelCommandRegistry / CommandMap here. Each factory
+ * returns an official `CommandDefinition`; `installChannelCommands` mounts a
+ * command-injected child plugin under the Agent's exact context. Channel
+ * commands register in the AGENT scope, so they shadow same-named globals and
+ * a same-scope duplicate throws (no custom priority/reserved-name system —
+ * spec §11/§43).
+ *
+ * The `deps` argument is the bridge hook surface channel commands need —
+ * every capability a handler uses arrives as a NARROW injected function or
+ * object, mirroring `/new`'s `startNewSession`. Handlers must NEVER read
+ * Harness services through `invocation.agent.ctx` (the agent-loop scoped
+ * context does not inject `commands` / `llm` — Cordis throws "without
+ * inject"); the bridge lazily bridges them through `deps` instead, exactly
+ * like the official compact/goal/plan commands close over their plugin ctx.
+ */
+import { type Context } from '@deepseek-ai/cordis';
+import type { Agent } from '@deepseek-ai/dsh-agent';
+import type { CommandDefinition, CommandDescriptor } from '@deepseek-ai/dsh-commands';
+import type { LlmCallConfig, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo } from '@deepseek-ai/dsh-llm';
+import { createNewCommand } from './new.js';
+import { createStopCommand } from './stop.js';
+import { createHelpCommand } from './help.js';
+import { createStatusCommand } from './status.js';
+import { createModelsCommand } from './models.js';
+import { createModelCommand } from './model.js';
+import { createVersionCommand } from './version.js';
+import { createMirrorCommand } from './mirror.js';
+import { createBindCommand } from './bind.js';
+import type { ChannelModelSelectionController } from '../model-selection.js';
+import type { ChannelCommandLocale } from './locale.js';
+import type { ChannelSessionControl } from '../session-control.js';
+import { sessionControlCommands } from './session-control.js';
+
+/**
+ * Narrow LLM seam handed to model commands (discovery + exact resolution).
+ * Structural subset of `ctx.llm` (`LlmRuntime`); the bridge bridges it lazily
+ * so handlers never touch the agent scoped context.
+ */
+export interface ChannelModelCatalog {
+  /** Registered provider routes (display metadata). */
+  listProviders(): LlmProviderInfo[];
+  /** Advisory model catalog for one provider (never request validation). */
+  listModels(provider: string): Promise<LlmModelInfo[]>;
+  /** Exact model metadata resolution, independent of the advisory catalog. */
+  resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>;
+  /** Validate a call config (incl. reasoning effort) against the exact model. */
+  resolveCallConfig(config: LlmCallConfig, signal?: AbortSignal): Promise<LlmCallConfig>;
+}
+
+/**
+ * Sanitized bundle update status (structural mirror of channel-control's
+ * `BundleUpdateStatus`; channel-harness carries no dependency edge on the
+ * control-plane package — it probes it live via `ctx.get('channelControl')`).
+ */
+export interface ChannelVersionInfo {
+  currentVersion: string;
+  update?: {
+    version: string;
+    tag: 'latest' | 'next';
+    crossLine: boolean;
+    commands: string[];
+  };
+  checkedAt?: number;
+}
+
+/** Bridge-provided capabilities available to channel commands. */
+export interface ChannelCommandDependencies {
+  sessions?: ChannelSessionControl;
+  /** Start a brand-new Harness session for the current conversation. */
+  startNewSession(agent: Agent): Promise<void>;
+  /** Harness session/default model view used by /status, /model and images. */
+  modelSelection: ChannelModelSelectionController;
+  /** Effective command view for an agent (global + agent-scope shadow). */
+  listCommands(agent: Agent): readonly CommandDescriptor[];
+  /** Resolve one effective command definition (scoped shadow or global). */
+  findCommand(agent: Agent, name: string): CommandDefinition | undefined;
+  /** Current explicit Harness Host locale; evaluated for every invocation. */
+  locale(): ChannelCommandLocale;
+  /** Harness LLM catalog seam (discovery + exact resolution), bridged lazily. */
+  llm: ChannelModelCatalog;
+  /**
+   * Live bundle update-status probe for /version (bridged from the plugin ctx
+   * over `ctx.get('channelControl')`). Optional: undefined when the control
+   * plane is absent — /version then degrades to the version-only output.
+   */
+  versionInfo?(): Promise<ChannelVersionInfo | undefined>;
+  /**
+   * Per-conversation mirror toggle backing (issue #5). The bridge binds it to
+   * the durable binding store; the state lives on `SessionBinding.mirror`.
+   */
+  mirror?: {
+    /** Current mirror state for the agent's bound conversation. */
+    get(agent: Agent): Promise<boolean>;
+    /** Toggle and persist the mirror state. */
+    set(agent: Agent, on: boolean): Promise<void>;
+  };
+  /**
+   * Rebind/attach an existing session to the current conversation (issue #6).
+   * `resolve` never mutates: it fail-closes on ambiguous prefixes, sessions
+   * bound elsewhere, and preset conflicts. `confirm` performs the rebind.
+   */
+  bind?: {
+    resolve(agent: Agent, query: string): Promise<ChannelBindResolution>;
+    confirm(agent: Agent, sessionId: string): Promise<void>;
+  };
+}
+
+/**
+ * Outcome of the fail-closed `/bind` resolution (issue #6). `resolved` still
+ * carries the two refusal flags — `boundElsewhere` / `conflict` — so the
+ * command can present the exact refusal reason before any mutation.
+ */
+export interface ChannelBindResolution {
+  kind: 'resolved' | 'missing' | 'ambiguous';
+  /** Unique target when `kind: 'resolved'`. */
+  sessionId?: string;
+  /** Ambiguous prefix candidates when `kind: 'ambiguous'` (bounded list). */
+  candidates?: string[];
+  /** Persisted Agent preset of the target (undefined = none recorded). */
+  preset?: string;
+  /** Target is already bound to a different conversation. */
+  boundElsewhere?: boolean;
+  /** Target's persisted preset conflicts with this conversation's route. */
+  conflict?: boolean;
+}
+
+export type ChannelCommandDisposer = () => Promise<void>;
+
+const commandFactories = [
+  createStopCommand,
+  createNewCommand,
+  createHelpCommand,
+  createStatusCommand,
+  createModelsCommand,
+  createModelCommand,
+  createVersionCommand,
+  createMirrorCommand,
+  createBindCommand,
+];
+
+/**
+ * Install the channel commands on an Agent scoped context. Registrations live
+ * for the life of that Agent scope and unwind together with it when the Agent
+ * is disposed.
+ */
+export function installChannelCommands(
+  agentCtx: Context,
+  deps: ChannelCommandDependencies,
+): Promise<ChannelCommandDisposer> {
+  const fiber = agentCtx.inject(['commands'], function* channelCommands(ctx) {
+    const managed = deps.sessions ? sessionControlCommands(deps.sessions) : [];
+    const overridden = new Set(managed.map(command => command.name));
+    for (const factory of commandFactories) {
+      const command = factory(deps);
+      if (!overridden.has(command.name)) yield ctx.commands.register(command);
+    }
+    for (const command of managed) yield ctx.commands.register(command);
+  });
+  return fiber.await().then(() => {
+    let disposing: Promise<void> | undefined;
+    return () => disposing ??= quiesceFiber(fiber);
+  });
+}
+
+async function quiesceFiber(fiber: ReturnType<Context['plugin']>): Promise<void> {
+  await Promise.resolve(fiber.dispose());
+  while (fiber.inertia !== undefined) await fiber.inertia;
+}
