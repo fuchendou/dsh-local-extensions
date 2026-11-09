@@ -1,0 +1,9 @@
+/outputs/
+/awesome-dsh-plugin/
+/.zcode/
+**/node_modules/
+**/.DS_Store
+**/*.log
+**/.env
+**/.env.*
+**/.credentials.yaml
