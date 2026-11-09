@@ -1,0 +1,18 @@
+{
+  "name": "dsh-smart-router",
+  "version": "1.2.0",
+  "type": "module",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "quality.js",
+    "cordis.patch.yml"
+  ],
+  "description": "DSH 任务分类、复杂度与多模态路由（Harness、DeepSeek、Jev 分类后端）",
+  "private": true,
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
