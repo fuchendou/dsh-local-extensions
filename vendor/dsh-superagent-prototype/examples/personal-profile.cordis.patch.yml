@@ -1,0 +1,12 @@
+# Replace the stateDir with an absolute path inside the protected dsh-channels data directory.
+- id: dsh-superagent
+  config:
+    stateDir: /absolute/path/to/dsh-home/dsh-channels/superagent
+    personal: true
+- id: dsh-superagent-github
+  disabled: true
+- id: dsh-superagent-feishu
+  disabled: true
+- insert:
+    - id: dsh-superagent-personal
+      name: dsh-superagent/personal-watch

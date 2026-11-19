@@ -17,7 +17,7 @@ test('real Cordis and command registry mount and dispose plugin capabilities', a
   const session = sessions.create(SessionId('test-office'));
   const agent = { id: session.id, session, status: 'idle', followup() {} };
   agent.ctx = createScope(ctx, agent).ctx;
-  const unregister = agents.register(agent);
+  const unregister = await agents.register(agent);
   const skillNames = ['office-documents', 'office-spreadsheets', 'office-presentations', 'office-pdf'];
   ctx.provide('web', { search: async () => ({ sources: [{ title: 'Example', url: 'https://example.com' }] }) });
   ctx.provide('skills', { snapshot: async () => ({ complete: true, skills: skillNames.map(name => ({ name, invocation: { userInvocable: true } })) }),

@@ -1,0 +1,21 @@
+- id: session-controller
+  disabled: true
+- id: attachment-local
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- insert:
+    - id: personalai-session-controller
+      name: ./node_modules/@deepseek-ai/dsh-api-session-controller/personalai-session-controller.mjs
+    - id: personalai-attachment-local
+      name: dsh-smart-router/web-attachments
+    - id: personalai-public-web
+      name: dsh-session-guard/public-web
+- id: web
+  config:
+    searchProvider: bing-free
+    fetchProvider: public-http
+- id: plugin-market
+  config:
+    indexes:
+      - https://cdn.jsdelivr.net/npm/dsh-plugin-catalog/index.json

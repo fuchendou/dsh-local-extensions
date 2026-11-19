@@ -26,6 +26,8 @@ const entrySchema = z.object({
   ]),
   lastEffective: selectionSchema.optional(),
   routine: z.object({ ownerSessionId: z.string(), selection: selectionSchema.optional() }).optional(),
+  superagent: z.boolean().optional(),
+  managed: z.object({ ownerSessionId: z.string(), role: z.enum(['router', 'worker']), ticketId: z.string().optional() }).optional(),
   previousSandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
   planStartOffset: z.number().int().nonnegative().optional(),
   notification: z.object({ key: z.string(), text: z.string(), sent: z.boolean() }).optional(),
@@ -91,7 +93,7 @@ export class ChannelSessionIndex {
   }
 
   async list(owner: SessionBinding): Promise<SessionEntry[]> {
-    return (await this.all()).filter(e => !e.routine && sameOwner(e.binding, owner))
+    return (await this.all()).filter(e => !e.routine && !e.managed && sameOwner(e.binding, owner))
       .sort((a, b) => b.binding.createdAt - a.binding.createdAt || a.binding.sessionId.localeCompare(b.binding.sessionId));
   }
 
@@ -110,6 +112,21 @@ export class ChannelSessionIndex {
       return current ? { ...current, binding } : {
         binding, title: title.trim().slice(0, 80) || '新会话', kind: 'chat', awaitingGoal: false,
         runIntent: 'paused', modelPolicy: { mode: 'auto' },
+      };
+    });
+  }
+
+  async trackManaged(binding: SessionBinding, ownerSessionId: string, role: 'router' | 'worker', ticketId?: string,
+    modelPolicy: SessionModelPolicy = { mode: 'auto' }): Promise<SessionEntry> {
+    return this.change(binding.sessionId, current => {
+      if (current && (!sameOwner(current.binding, binding) || current.managed?.ownerSessionId !== ownerSessionId
+          || current.managed.role !== role || current.managed.ticketId !== ticketId)) {
+        throw new Error('后台会话归属冲突。');
+      }
+      return current ?? {
+        binding, title: role === 'router' ? 'Super-agent 路由' : 'Super-agent 任务',
+        kind: 'chat', awaitingGoal: false, runIntent: 'paused', modelPolicy,
+        managed: { ownerSessionId, role, ...(ticketId ? { ticketId } : {}) },
       };
     });
   }

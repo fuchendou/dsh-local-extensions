@@ -2,13 +2,14 @@
 
 本仓库保存 DeepSeek Harness 的本地插件、配套部署说明，以及适配后的第三方插件源码快照。
 
-- `plugins/`：智能路由、会话历史保护和办公助手。
+- `plugins/`：智能路由、会话历史保护、办公助手和个人后台任务隔离。
 - `vendor/`：第三方项目的源码快照，包含基于下列上游版本的本地改动；各项目保留自己的许可证。
 - `DEPLOY.md`：部署和维护记录。
 - `scripts/`：本机访问 DSH Web 的示例脚本。
 
 | 快照 | 上游仓库 | 上游基线 commit |
 |---|---|---|
+| `vendor/dsh-superagent-prototype` | [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype) | `8c32a9dc5d72c033816c6a8110b37f40cf94fba4` |
 | `vendor/dsh-channels` | [wsz987/dsh-channels](https://github.com/wsz987/dsh-channels) | `8401caaa340cc0ec5b29e473569993e49d2b3a5b` |
 | `vendor/dsh-office-kit` | [hairyf/dsh-office-kit](https://github.com/hairyf/dsh-office-kit) | `178c4839194eabe131b088fdc8decfb8bb9a851c` |
 | `vendor/dsh-todo-reminder` | [Meltllsy/dsh-todo-reminder](https://github.com/Meltllsy/dsh-todo-reminder) | `cc9cfb24c220af6a49c05252475ec331bdeed6d2` |

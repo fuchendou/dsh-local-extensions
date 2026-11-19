@@ -9,6 +9,11 @@ interface HelpEntry {
 }
 
 const zh: Record<string, HelpEntry> = {
+  super: { usage: '/super on|off|status|confirm 确认码', summary: '开启、关闭或确认 Super-agent 任务。',
+    details: ['开启后由 Super-agent 处理普通消息；关闭后已接任务继续。', '可能执行操作的请求须核对原消息，并用一次性确认码确认；不想执行时忽略。'] },
+  tasks: { usage: '/tasks', summary: '查看 Super-agent 任务。', details: ['任务列表显示短 ID、状态和最近结果。'] },
+  task: { usage: '/task <ID|stop ID>', summary: '查看或停止一个 Super-agent 任务。',
+    details: ['例如 /task 12345678；/task stop 12345678 停止指定任务。'] },
   new: {
     usage: '/new [名称]', summary: '创建并切换到空白会话，保留共享工作文件。',
     details: ['不带名称时使用默认名称；旧会话仍可通过 /sessions 找回。', '示例：/new 工作计划', '普通会话正在运行时，请先 /stop；后台目标可继续运行。'],
@@ -118,6 +123,10 @@ const zh: Record<string, HelpEntry> = {
 };
 
 const en: Record<string, HelpEntry> = {
+  super: { usage: '/super on|off|status|confirm code', summary: 'Enable, disable or confirm a Super-agent task.',
+    details: ['After disabling, accepted background tasks continue.', 'Review the original message and use its one-time code to confirm an action; ignore it otherwise.'] },
+  tasks: { usage: '/tasks', summary: 'List Super-agent tasks.', details: ['Shows task IDs, state and latest result.'] },
+  task: { usage: '/task <ID|stop ID>', summary: 'Inspect or stop one Super-agent task.', details: ['Use /task stop ID to stop a task.'] },
   new: { usage: '/new [name]', summary: 'Start an empty session and keep shared workspace files.', details: ['Example: /new Work plan. Previous sessions remain available via /sessions.', 'Stop an ordinary running task first; background goals may continue.'] },
   session: { usage: '/session', summary: 'Show the current session, mode, model and goal status.', details: ['Shows the short ID, name, status, model policy and any goal progress.'] },
   sessions: { usage: '/sessions [page]', summary: 'List your sessions; ● marks the current one.', details: ['There are at most 10 sessions per page. Example: /sessions 2. Use an ID from the list with /switch.'] },
@@ -154,7 +163,7 @@ const en: Record<string, HelpEntry> = {
 const sections = [
   ['会话与上下文', 'Sessions and context', ['new', 'session', 'sessions', 'switch', 'history', 'rename', 'compact', 'bind']],
   ['模型与思考强度', 'Models and reasoning', ['model', 'models', 'effort']],
-  ['规划与后台目标', 'Planning and goals', ['plan', 'execute', 'goal']],
+  ['规划与后台目标', 'Planning and goals', ['plan', 'execute', 'goal', 'super', 'tasks', 'task']],
   ['联网查询', 'Web search', ['search']],
   ['办公文件', 'Office files', ['documents', 'spreadsheets', 'presentations', 'pdf']],
   ['待办与提醒', 'Todos and reminders', ['todo', 'remind', 'reminders', 'brief']],

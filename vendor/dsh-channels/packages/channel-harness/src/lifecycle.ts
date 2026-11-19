@@ -256,6 +256,17 @@ export function startBridge(
           senderId: binding.senderId, mentionedBot: true, policy: resolved.policy,
         }).authorized;
       },
+      ownerAuthorized: async binding => {
+        if (!binding.senderId || binding.conversationType !== 'dm') return false;
+        const resolved = await accessResolver.resolve(binding.channelId, binding.accountId);
+        return resolved.state === 'present' && resolved.policy.ownerId === binding.senderId
+          && new InboundAccessController().authorize({
+            conversationType: binding.conversationType, conversationId: binding.conversationId,
+            senderId: binding.senderId, mentionedBot: true, policy: resolved.policy,
+          }).authorized;
+      },
+      readAttachment: (id, sessionId, offset, limit, signal) => fileProvider.readExtracted!(id, sessionId, offset, limit, signal),
+      resolveAttachment: (id, sessionId) => fileProvider.resolveAttachment(id, sessionId),
       adapter: getAdapter,
       replyContext: (sessionId, turn) => replyContexts.getTurn(sessionId, turn),
     }) : undefined;

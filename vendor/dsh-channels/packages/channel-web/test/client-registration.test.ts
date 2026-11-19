@@ -201,14 +201,14 @@ describe('@wsz987/channel-web client module graph contract', () => {
 
   it('layers dependencies per the current static/dynamic split', () => {
     // Dynamic client dependency → peer + dev (compile input).
-    expect(pkg.peerDependencies?.['@deepseek-ai/dsh-client-locale']).toBe('0.2.1-rc.5');
-    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-locale']).toBe('0.2.1-rc.5');
-    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-slots']).toBe('0.2.1-rc.5');
-    expect(pkg.peerDependencies?.['@deepseek-ai/dsh-client-ui-settings']).toBe('0.2.1-rc.5');
-    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-settings']).toBe('0.2.1-rc.5');
+    expect(pkg.peerDependencies?.['@deepseek-ai/dsh-client-locale']).toBe('0.2.2-rc.5');
+    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-locale']).toBe('0.2.2-rc.5');
+    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-slots']).toBe('0.2.2-rc.5');
+    expect(pkg.peerDependencies?.['@deepseek-ai/dsh-client-ui-settings']).toBe('0.2.2-rc.5');
+    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-settings']).toBe('0.2.2-rc.5');
     // Static UI library → dev-only compilation input, never a peer.
     expect(pkg.peerDependencies?.['@deepseek-ai/dsh-client-ui-primitives']).toBeUndefined();
-    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-primitives']).toBe('0.2.1-rc.5');
+    expect(pkg.devDependencies?.['@deepseek-ai/dsh-client-ui-primitives']).toBe('0.2.2-rc.5');
     // React is shell-owned: dev-only, not shipped as a dependency.
     expect(pkg.dependencies?.react).toBeUndefined();
     expect(pkg.peerDependencies?.react).toBeUndefined();

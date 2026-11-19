@@ -846,7 +846,7 @@ export class ChannelHarnessBridge {
             context: { conversationType: event.conversation.type, senderId: event.sender.id,
               replyToMessageId: event.message.id, raw: event.raw, runId: randomUUID() },
           });
-        }, run)
+        }, run, () => this.isGenerationCurrent(key, generation))
         : await run();
       if (execution !== undefined) {
         await this.renderCommandResult(event, execution.result);
@@ -880,11 +880,37 @@ export class ChannelHarnessBridge {
     // --- Ordinary message followup --------------------------------------------
     const runId = randomUUID();
     this.logInboundBinaryAvailability(event, binding.sessionId);
-    const userMessage = await toHarnessUserMessage(event, {
+    const attachmentIds: string[] = [];
+    const imageIds: string[] = [];
+    const isolated = await this.options.sessions?.usesIsolatedSuperagentAttachments?.(binding.sessionId);
+    const images = new Set<StoredBinaryPart>();
+    const content = isolated ? event.message.content.map(part => {
+      if (part.type !== 'image') return part;
+      const image = { type: 'file' as const, name: part.alt ?? '图片', mimeType: part.mimeType, localData: part.localData };
+      images.add(image);
+      return image;
+    }) : event.message.content;
+    const fileStore = this.fileStoreHook(event, binding.sessionId, isolated);
+    const userMessage = await toHarnessUserMessage({ ...event, message: { ...event.message, content } }, {
       includeMetadataPrefix: this.options.config.includeMetadataPrefix,
-      saveImage: this.saveImageHook(event, binding.sessionId),
-      fileStore: this.fileStoreHook(event, binding.sessionId),
+      saveImage: isolated ? undefined : this.saveImageHook(event, binding.sessionId),
+      fileStore: fileStore ? async part => {
+        const stored = await fileStore(part);
+        if (stored) (images.has(part) ? imageIds : attachmentIds).push(stored.attachmentId);
+        return stored;
+      } : undefined,
     });
+    if (!this.isGenerationCurrent(key, generation)) return;
+    try {
+      if (await this.options.sessions?.receiveSuperagent(agentRef!.agent, String(event.message.id), userMessage, attachmentIds,
+        () => this.isGenerationCurrent(key, generation), imageIds)) return;
+    } catch (error) {
+      await this.sendCommandNotice(event, error instanceof Error ? error.message : 'Super-agent 无法处理消息。');
+      return;
+    }
+    if (!this.isGenerationCurrent(key, generation)) return;
+    await this.options.sessions?.prepareAutomaticRoute?.(agentRef!.agent, userMessage);
+    if (!this.isGenerationCurrent(key, generation)) return;
     // Register the reply context keyed by the Harness UserMessage id strictly
     // BEFORE followup.
     this.options.replyContexts.register(userMessage.id, {
@@ -940,9 +966,12 @@ export class ChannelHarnessBridge {
           await this.sendCommandNotice(event, '已停止当前任务。');
         }
       } else {
-        // Binding exists but no process-local live agent (cold/resumed
-        // elsewhere): nothing to cancel here; the barrier re-checks below.
-        await this.sendCommandNotice(event, '已停止当前任务。');
+        try {
+          const stopped = await this.options.sessions?.stopSuperagentBinding(binding);
+          await this.sendCommandNotice(event, stopped ? '已停止 Super-agent 的未完成任务。' : '已停止当前任务。');
+        } catch (error) {
+          await this.sendCommandNotice(event, error instanceof Error ? error.message : '无法确认后台任务已停止。');
+        }
       }
     } else {
       // ③ No session: never create one for /stop (spec §39).
@@ -1026,7 +1055,7 @@ export class ChannelHarnessBridge {
    * placeholders (unchanged fallback). The hook binds the current binding's
    * session + event identity so a stored asset is correctly session-ACL'd.
    */
-  private fileStoreHook(event: MessageReceived, sessionId: string): FileStoreHook | undefined {
+  private fileStoreHook(event: MessageReceived, sessionId: string, deferExtraction?: boolean): FileStoreHook | undefined {
     if (!this.options.fileProvider) return undefined;
     const provider = this.options.fileProvider;
     return async (part: StoredBinaryPart) => {
@@ -1041,6 +1070,7 @@ export class ChannelHarnessBridge {
             ...(event.conversation.type ? { conversationType: event.conversation.type } : {}),
             ...(event.conversation.threadId ? { threadId: event.conversation.threadId } : {}),
             messageId: event.message.id,
+            ...(deferExtraction ? { deferExtraction: true } : {}),
           },
           part,
         );

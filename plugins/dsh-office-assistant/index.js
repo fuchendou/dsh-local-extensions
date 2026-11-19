@@ -1,6 +1,6 @@
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import { formatBeijing, parseSchedule } from './time.js';
-import { deliverPresentedFiles } from './delivery.js';
+import { deliverPresentedFiles, readWorkspaceFile } from './delivery.js';
 import { mountBriefings } from './briefing.js';
 
 export const name = 'dsh-office-assistant';
@@ -36,7 +36,7 @@ export function officeCommand(ctx, command) {
     const skill = await ctx.skills.get(skillName, { cwd: agent.session.header.cwd, scope: agent, signal });
     if (!skill || !skill.invocation.userInvocable) throw new Error(`${label}功能未就绪。`);
     const message = createUserMessage({ content: [{ type: 'text', text: `/${skillName} ${request}` }], source: { kind: 'user' } });
-    ctx.channelSessions.submitFromCommand(agent, message);
+    await ctx.channelSessions.submitFromCommand(agent, message, signal);
     return `已开始处理${label}，结果将在本会话回复。`;
   });
 }
@@ -165,11 +165,19 @@ export function apply(ctx, config = {}) {
   ctx.inject(['channelSessions', 'personalTodos', 'schedule', 'web', 'llm', 'tools', 'commands', 'timer'], scope => {
     scope.effect(() => mountBriefings(scope, config), 'office-assistant: daily briefings');
   });
-  ctx.inject(['channelSessions', 'channelHistoryGuard'], scope => scope.effect(() => scope.on('session/event', (session, event) => {
-    if (event.type !== 'deliverables/presented') return;
-    const deliver = scope.channelSessions.fileDeliveryForTurn(String(session.id), event.data.turn);
-    if (deliver) void deliverPresentedFiles(scope.channelHistoryGuard, session, event.data.files, deliver);
-  }), 'office-assistant: channel files'));
+  ctx.inject(['channelSessions', 'channelHistoryGuard'], scope => scope.effect(() => {
+    const stopReader = scope.channelSessions.registerSuperagentFileReader?.(async (id, path) => {
+      const session = scope.get('sessions')?.get(id) ?? scope.get('agents')?.get(id)?.session;
+      if (!session?.header?.cwd) throw new Error('后台任务工作目录不可用。');
+      return readWorkspaceFile(scope.channelHistoryGuard, session.header.cwd, path);
+    });
+    const stopEvents = scope.on('session/event', (session, event) => {
+      if (event.type !== 'deliverables/presented') return;
+      const deliver = scope.channelSessions.fileDeliveryForTurn(String(session.id), event.data.turn);
+      if (deliver) void deliverPresentedFiles(scope.channelHistoryGuard, session, event.data.files, deliver);
+    });
+    return () => { stopReader?.(); stopEvents(); };
+  }, 'office-assistant: channel files'));
   ctx.inject(['commands', 'web'], scope => scope.effect(() => register(scope, [searchCommand(scope)]), 'office-assistant: search'));
   ctx.inject(['commands', 'personalTodos', 'channelSessions'], scope => scope.effect(() => register(scope, todoCommands(scope)), 'office-assistant: todos'));
   ctx.inject(['tools', 'personalTodos', 'channelSessions'], scope => scope.effect(() => scope.tools.register(reminderTool(scope)), 'office-assistant: reminder tool'));

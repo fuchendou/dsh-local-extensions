@@ -56,13 +56,13 @@
 ## 使用前须知
 
 - 确认 `npx @deepseek-ai/dsh` 可运行，且 Harness Web 普通会话可正常对话。
-- 本地适配版需要 DeepSeek Harness `0.2.1-rc.5` 与 Node `24.9+`（版本对照见[兼容矩阵](docs/compatibility-matrix.md)）。
+- 本地适配版需要 DeepSeek Harness `0.2.2-rc.5` 与 Node `24.9+`（版本对照见[兼容矩阵](docs/compatibility-matrix.md)）。
 - 渠道会话通常使用 `Workspace Write`；仅在确需访问 Workspace 外文件且信任当前任务时启用 `Full access`。
 - 项目仍在快速迭代，升级前请备份数据。
 
 ## 安装与更新
 
-此工作副本使用本地构建的 `0.5.2-personalai` 包，适配 DSH `0.2.1-rc.5`。npm 上游 `@wsz987/dsh-channels@0.5.1` 仍绑定旧版 DSH，不能直接替换本地构建。
+此工作副本使用本地构建的 `0.5.2-personalai` 包，适配 DSH `0.2.2-rc.5`。npm 上游 `@wsz987/dsh-channels@0.5.1` 仍绑定旧版 DSH，不能直接替换本地构建。
 
 构建、锁文件、备份和部署步骤见工作区的 [DEPLOY.md](../../DEPLOY.md)。先在隔离环境完成验证，再使用配套 tarball 和 overrides；不要对线上 profile 执行未经验证的自动升级。
 

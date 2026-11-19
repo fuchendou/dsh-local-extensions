@@ -250,7 +250,7 @@ describe('CardKit 2.0 native streaming through the generic ReplyRouter', () => {
 
     const chunkCount = 20;
     for (let i = 0; i < chunkCount; i += 1) {
-      router.onSessionEvent(session, chunkEvent(0, 'a'.repeat(i + 1)));
+      router.onSessionEvent(session, chunkEvent(0, 'a'));
       await sleep(8);
     }
 

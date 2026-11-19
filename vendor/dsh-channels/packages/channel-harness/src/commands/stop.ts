@@ -13,15 +13,20 @@
 import { type CommandDefinition } from '@deepseek-ai/dsh-commands';
 import type { ChannelCommandDependencies } from './index.js';
 
-export function createStopCommand(_deps: ChannelCommandDependencies): CommandDefinition {
+export function createStopCommand(deps: ChannelCommandDependencies): CommandDefinition {
   return {
     name: 'stop',
     description: 'Stop the current task immediately',
-    handler(invocation) {
+    async handler(invocation) {
       if (invocation.rawInput.trim().length > 0) {
         return { kind: 'error', text: 'Usage: /stop' };
       }
       invocation.agent.cancel({ kind: 'user' });
+      try {
+        if (await deps.sessions?.stopSuperagent(invocation.agent)) return { kind: 'success', text: '已停止 Super-agent 的未完成任务。' };
+      } catch (error) {
+        return { kind: 'error', text: error instanceof Error ? error.message : '无法确认后台任务已停止。' };
+      }
       return { kind: 'success', text: '已停止当前任务。' };
     },
   };

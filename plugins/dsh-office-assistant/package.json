@@ -1,10 +1,10 @@
 {
   "name": "dsh-office-assistant",
-  "version": "1.1.0-personalai.1",
+  "version": "1.1.0-personalai.2",
   "private": true,
   "type": "module",
   "main": "./index.js",
   "files": ["index.js", "time.js", "delivery.js", "briefing.js", "briefing-store.js", "briefing-sources.js", "cordis.patch.yml"],
   "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
-  "peerDependencies": { "@deepseek-ai/dsh-llm": "0.2.1-rc.5" }
+  "peerDependencies": { "@deepseek-ai/dsh-llm": "0.2.2-rc.5" }
 }

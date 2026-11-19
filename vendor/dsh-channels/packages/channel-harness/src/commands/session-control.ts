@@ -2,6 +2,9 @@ import type { CommandDefinition } from '@deepseek-ai/dsh-commands';
 import type { ChannelSessionControl } from '../session-control.js';
 
 const definitions = [
+  ['super', '[on|off|status|confirm 确认码]', '开启、关闭或确认 Super-agent 任务'],
+  ['tasks', '', '查看 Super-agent 后台任务'],
+  ['task', '<ID|stop ID>', '查看或停止 Super-agent 任务'],
   ['new', '[名称]', '开启空白聊天，保留共享工作文件'],
   ['session', '', '查看当前会话'], ['sessions', '[页码]', '列出自己的历史会话'],
   ['switch', '<会话短ID>', '切换会话'], ['history', '[会话短ID] [页码]', '查看聊天记录'],

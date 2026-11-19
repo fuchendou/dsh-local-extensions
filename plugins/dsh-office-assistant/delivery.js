@@ -15,7 +15,7 @@ function within(path, root) {
   return rest !== '' && !isAbsolute(rest) && rest !== '..' && !rest.startsWith(`..${sep}`);
 }
 
-async function readWorkspaceFile(guard, cwd, path) {
+export async function readWorkspaceFile(guard, cwd, path) {
   const root = await realpath(cwd);
   const file = await realpath(resolve(root, path));
   if (!within(file, root) || !MIME[extname(file).toLowerCase()]) throw new Error('仅支持工作目录内的 Office 或 PDF 文件。');

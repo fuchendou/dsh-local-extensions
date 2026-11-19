@@ -1,5 +1,5 @@
 import { Service, type Context } from '@deepseek-ai/cordis';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Agent } from '@deepseek-ai/dsh-agent';
@@ -10,15 +10,17 @@ import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import type {} from '@deepseek-ai/dsh-goal';
 import type {} from '@deepseek-ai/dsh-plan-mode';
 import type {} from '@deepseek-ai/dsh-compaction';
-import type {} from '@deepseek-ai/dsh-sandbox-policy';
+import type {} from '@deepseek-ai/dsh-subagent';
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy';
 import type { ChannelAdapter, ChannelTarget } from '@wsz987/channel-core';
 import type { AgentRef } from './agent-manager.js';
 import type { FreshChannelSession } from './channel-session-factory.js';
 import type { SessionBindingStore } from './binding-store.js';
 import { bindingKey, type SessionBinding } from './session-router.js';
-import { ChannelSessionIndex, shortSessionId, type SessionEntry, type SessionModelPolicy, type SessionModelSelection } from './session-index.js';
+import { ChannelSessionIndex, sameOwner, shortSessionId, type SessionEntry, type SessionModelPolicy, type SessionModelSelection } from './session-index.js';
 import { targetFromBinding } from './outbox/target.js';
 import { splitMessage } from './reply-router.js';
+import type { ResolvedChannelAttachment } from './file-provider.js';
 import type { ChannelReplyContext } from './reply-context-store.js';
 
 declare module '@deepseek-ai/cordis' {
@@ -33,6 +35,9 @@ export interface SessionControlOperations {
   acquire(binding: SessionBinding): Promise<AgentRef>;
   events(id: string): Promise<readonly SessionEvent[]>;
   authorized(binding: SessionBinding): Promise<boolean>;
+  ownerAuthorized?(binding: SessionBinding): Promise<boolean>;
+  readAttachment?(id: string, sessionId: string, offset: number, limit: number, signal: AbortSignal): Promise<unknown>;
+  resolveAttachment?(id: string, sessionId: string): Promise<ResolvedChannelAttachment>;
   adapter(channelId: string): ChannelAdapter | undefined;
   replyContext?(sessionId: string, turn: number): ChannelReplyContext | undefined;
 }
@@ -47,6 +52,21 @@ export interface ChannelRoutineHandler {
   failed(sessionId: string): Promise<void>;
 }
 
+export interface ChannelSuperagentHandler {
+  isolateAttachments?: boolean;
+  ready(owner: ChannelOwner): Promise<void>;
+  receive(input: { owner: ChannelOwner; sessionId: string; messageId: string; message: UserMessage; attachmentIds: string[];
+    imageIds?: string[]; isCurrent(): boolean }): Promise<void>;
+  confirm(owner: ChannelOwner, code: string, isCurrent: () => boolean): Promise<string>;
+  cancelPending(owner: ChannelOwner): Promise<void>;
+  command(owner: ChannelOwner, name: 'tasks' | 'task', input: string): Promise<string>;
+  stop(owner: ChannelOwner): Promise<void>;
+}
+
+export interface ChannelSuperagentFile {
+  type: 'file'; name: string; localData: Uint8Array; mimeType?: string;
+}
+
 function ownerKey(binding: SessionBinding): string {
   return createHash('sha256').update(JSON.stringify([binding.channelId, binding.accountId, binding.conversationId,
     binding.conversationType, binding.senderId ?? null, binding.threadId ?? null])).digest('hex');
@@ -57,11 +77,14 @@ export class ChannelSessionControl extends Service {
   private notifications = new Map<string, Promise<void>>();
   private observed = new Map<string, Promise<void>>();
   private timer?: ReturnType<typeof setInterval>;
-  private automaticRouters = 0;
+  private automaticRouter?: (agent: Agent, message: UserMessage, signal?: AbortSignal) => Promise<void>;
+  private readonly managedRoleModels = new WeakMap<Agent, ReturnType<Agent['model']['current']>>();
   private commands = new Set<Promise<string>>();
-  private readonly commandReply = new AsyncLocalStorage<{ agent: Agent; active: boolean; register(message: UserMessage): void }>();
+  private readonly commandReply = new AsyncLocalStorage<{ agent: Agent; active: boolean; register(message: UserMessage): void; isCurrent(): boolean }>();
   private readonly disposers: (() => unknown)[] = [];
   private routineHandler?: ChannelRoutineHandler;
+  private superagentHandler?: ChannelSuperagentHandler;
+  private superagentFileReader?: (sessionId: string, path: string) => Promise<ChannelSuperagentFile>;
   private readonly restrictedRoutines = new WeakSet<Agent>();
 
   constructor(ctx: Context, readonly index: ChannelSessionIndex,
@@ -73,6 +96,9 @@ export class ChannelSessionControl extends Service {
     this.disposers.push(this.ctx.on('agent/pre-step', async (payload, next) => {
       await this.index.ready;
       const entry = this.getSessionEntry(String(payload.agent.id));
+      if (entry?.managed) {
+        try { await this.syncSuperagentPermissions(payload.agent, entry); } catch { return { kind: 'reject' }; }
+      }
       if (!entry?.routine) return next();
       if (!this.routineHandler || !await this.operations.authorized(entry.binding)) return { kind: 'reject' };
       if (payload.step >= 12) {
@@ -112,29 +138,52 @@ export class ChannelSessionControl extends Service {
         void task.finally(() => { if (this.observed.get(id) === task) this.observed.delete(id); });
       }
     }));
+    this.disposers.push(this.ctx.on('agent/inbox/claimed', ({ agent }) => {
+      const entry = this.getSessionEntry(String(agent.id));
+      if (!entry) return;
+      const policy = entry.modelPolicy;
+      let selected = policy?.mode === 'manual' ? policy.selection : undefined;
+      if (entry.managed) {
+        if (selected && !this.managedRoleModels.has(agent)) {
+          this.managedRoleModels.set(agent, agent.model.current());
+        } else if (!selected && this.managedRoleModels.has(agent)) {
+          selected = this.managedRoleModels.get(agent);
+          this.managedRoleModels.delete(agent);
+        }
+      }
+      if (policy?.mode !== 'manual' && entry.routine) {
+        selected = entry.routine.selection
+          ?? { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' };
+      }
+      if (policy?.mode === 'auto' && !this.automaticRouter && !entry.managed && !entry.routine) {
+        selected = this.ctx.get('agentDefaultModel')?.currentSelection();
+      }
+      if (!selected?.provider || !selected.model) return;
+      const { provider, model, reasoningEffort } = selected;
+      try {
+        agent.model.select({ provider, model,
+          ...(reasoningEffort ? { reasoningEffort: ReasoningEffortId(reasoningEffort) } : {}) });
+      } catch (error) {
+        this.ctx.logger.warn('unable to select channel model', error);
+      }
+    }));
     this.disposers.push(this.ctx.on('agent/request', async (payload, next) => {
       const entry = await this.index.get(String(payload.agent.id));
+      if (entry?.managed && !await this.operations.ownerAuthorized?.(entry.binding)) {
+        throw new Error('后台任务的所有者权限已失效。');
+      }
       if (entry?.kind === 'goal' && !await this.operations.authorized(entry.binding)) {
         await this.pause(payload.agent);
         throw new Error('目标会话的访问权限已失效，已停止执行。');
       }
-      const resolved = await next();
-      const policy = entry?.modelPolicy;
-      if (entry?.routine && policy?.mode !== 'manual') {
-        const { reasoningEffort: _old, ...rest } = resolved;
-        const { reasoningEffort, ...selection } = entry.routine.selection
-          ?? { provider: 'deepseek-official', model: 'deepseek-v4-pro', reasoningEffort: 'high' };
-        return { ...rest, ...selection, ...(reasoningEffort ? { reasoningEffort: ReasoningEffortId(reasoningEffort) } : {}) };
-      }
-      if (!policy || (policy.mode === 'auto' && this.automaticRouters > 0)) return resolved;
-      const selected = policy.mode === 'manual' ? policy.selection : this.ctx.get('agentDefaultModel')?.currentSelection();
-      if (!selected?.provider || !selected.model) return resolved;
-      const { reasoningEffort: _old, ...rest } = resolved;
-      const { reasoningEffort, ...selection } = selected;
-      return { ...rest, ...selection, ...(reasoningEffort ? { reasoningEffort: ReasoningEffortId(reasoningEffort) } : {}) };
+      return next();
     }));
     this.disposers.push(this.ctx.on('tools/pre-execute', async (execution, next) => {
       const entry = execution.agent && this.getSessionEntry(String(execution.agent.id));
+      if (entry?.managed && execution.agent) {
+        try { await this.syncSuperagentPermissions(execution.agent, entry); }
+        catch { return { kind: 'deny', reason: '后台任务的所有者权限不可用。' }; }
+      }
       if (entry?.kind === 'goal' && ['ask_user_question', 'exit_plan_mode'].includes(execution.name)) {
         return { kind: 'deny', reason: '自主目标会话不弹出询问；采用合理假设继续。若用户已进入只读规划模式，直接提供计划并等待 /execute。确有外部阻塞时记录目标阻塞。' };
       }
@@ -195,23 +244,22 @@ export class ChannelSessionControl extends Service {
 
   async track(binding: SessionBinding): Promise<void> { await this.index.track(binding); }
   getSessionEntry(id: string): SessionEntry | undefined {
-    const registry = this.ctx.get('agents');
-    const visited = new Set<string>();
-    let current: string | undefined = id;
-    while (current && !visited.has(current)) {
-      visited.add(current);
-      const entry = this.index.peek(current);
-      if (entry) return entry;
-      const childId = SessionId(current);
-      current = registry?.list().find(parent => registry.isOwnedBy(childId, parent))?.id;
+    const entry = this.index.peek(id);
+    if (entry) return entry;
+    const child = this.ctx.get('agents')?.get(SessionId(id));
+    if (child?.session?.header.origin !== 'subagent') return undefined;
+    try {
+      const root = this.ctx.get('subagents')?.rootOf(child);
+      return root && this.index.peek(String(root.id));
+    } catch {
+      return undefined;
     }
-    return undefined;
   }
   getProtectedPaths(): string[] { return this.index.storagePath ? [dirname(this.index.storagePath)] : []; }
   async ownerForAgent(agent: Agent): Promise<ChannelOwner> {
     const entry = this.getSessionEntry(String(agent.id));
     if (!entry || !await this.operations.authorized(entry.binding)) throw new Error('无法确认当前渠道的所有者。');
-    return { key: ownerKey(entry.binding), sessionId: entry.binding.sessionId };
+    return { key: ownerKey(entry.binding), sessionId: entry.managed?.ownerSessionId ?? entry.binding.sessionId };
   }
   assertWritable(agent: Agent): void {
     const entry = this.getSessionEntry(String(agent.id));
@@ -222,7 +270,7 @@ export class ChannelSessionControl extends Service {
   async listOwners(): Promise<ChannelOwner[]> {
     const owners = new Map<string, ChannelOwner>();
     for (const entry of await this.index.all()) {
-      if (entry.routine) continue;
+      if (entry.routine || entry.managed) continue;
       if (!await this.operations.authorized(entry.binding)) continue;
       const key = ownerKey(entry.binding);
       owners.set(key, { key, sessionId: entry.binding.sessionId });
@@ -243,6 +291,148 @@ export class ChannelSessionControl extends Service {
     if (!adapter) throw new Error('提醒渠道不可用。');
     const result = await adapter.send(targetFromBinding(entry.binding), { text });
     if ('delivered' in result && result.delivered === false) throw new Error('提醒发送未确认。');
+  }
+
+  async notifySuperagentOwner(owner: ChannelOwner, text: string): Promise<void> {
+    await this.validateSuperagentOwner(owner);
+    await this.notifyOwner(owner, text);
+  }
+
+  registerSuperagentHandler(handler: ChannelSuperagentHandler): () => void {
+    if (this.superagentHandler) throw new Error('Super-agent 处理器已注册。');
+    this.superagentHandler = handler;
+    return () => { if (this.superagentHandler === handler) this.superagentHandler = undefined; };
+  }
+
+  registerSuperagentFileReader(reader: (sessionId: string, path: string) => Promise<ChannelSuperagentFile>): () => void {
+    if (this.superagentFileReader) throw new Error('Super-agent 文件服务已注册。');
+    this.superagentFileReader = reader;
+    return () => { if (this.superagentFileReader === reader) this.superagentFileReader = undefined; };
+  }
+
+  async deliverSuperagentFile(owner: ChannelOwner, sessionId: string, path: string, isolatedFile?: ChannelSuperagentFile): Promise<void> {
+    const entry = await this.validateSuperagentOwner(owner);
+    const worker = await this.index.get(sessionId);
+    if (!worker?.managed || worker.managed.role !== 'worker' || ownerKey(worker.binding) !== owner.key
+        || !await this.operations.ownerAuthorized?.(worker.binding)) throw new Error('文件任务不属于当前所有者。');
+    const file = isolatedFile ?? await this.superagentFileReader?.(sessionId, path);
+    if (!file) throw new Error('办公文件投递服务不可用。');
+    await this.validateSuperagentOwner(owner);
+    const adapter = this.operations.adapter(entry.binding.channelId);
+    if (!adapter?.capabilities.file) throw new Error('当前渠道不支持发送文件。');
+    const result = await adapter.send(targetFromBinding(entry.binding), { parts: [file] });
+    if ('delivered' in result && result.delivered === false) throw new Error('文件发送未确认。');
+  }
+
+  async validateSuperagentOwner(owner: ChannelOwner): Promise<SessionEntry> {
+    const entry = await this.index.get(owner.sessionId);
+    if (!entry || entry.routine || entry.managed || ownerKey(entry.binding) !== owner.key
+        || !await this.operations.ownerAuthorized?.(entry.binding)) {
+      throw new Error('无法确认 Super-agent 所有者或其权限已失效。');
+    }
+    return entry;
+  }
+
+  async registerSuperagentSession(owner: ChannelOwner, sessionId: string, role: 'router' | 'worker', ticketId?: string,
+    useManualModel = false): Promise<void> {
+    const entry = await this.validateSuperagentOwner(owner);
+    const optional = this.ctx as unknown as { get(name: string): { historyIsolation?: boolean } | undefined };
+    if (!optional.get('channelHistoryGuard') || !optional.get('sandbox')?.historyIsolation) {
+      throw new Error('渠道历史保护未就绪。');
+    }
+    const now = Date.now();
+    await this.index.trackManaged({ ...entry.binding, sessionId, mirror: false, createdAt: now, updatedAt: now },
+      owner.sessionId, role, ticketId, role === 'worker' && useManualModel ? entry.modelPolicy : { mode: 'auto' });
+  }
+
+  private async syncSuperagentPermissions(agent: Agent, entry: SessionEntry): Promise<void> {
+    if (!entry.managed) throw new Error('不是 Super-agent 会话。');
+    const source = await this.index.get(entry.managed.ownerSessionId);
+    if (!source || source.managed || !sameOwner(source.binding, entry.binding)
+        || !await this.operations.ownerAuthorized?.(source.binding)) throw new Error('后台任务的所有者权限已失效。');
+    const sandbox = this.ctx.get('sandboxPolicy');
+    const approval = this.ctx.get('approval');
+    if (!sandbox || !approval) throw new Error('权限服务未就绪。');
+    const original = (await this.operations.acquire(source.binding)).agent.session;
+    const originalMode = sandbox.resolve({ session: original }).mode;
+    const mode = entry.managed.role === 'router' || originalMode === 'read-only' ? 'read-only' : 'workspace-write';
+    if (sandbox.resolve({ session: agent.session }).mode !== mode) setSandboxMode(agent.session, mode);
+    const policy = approval.overrideOf(original) ?? approval.config.policy ?? 'ask';
+    if ((approval.overrideOf(agent.session) ?? approval.config.policy ?? 'ask') !== policy) setApprovalPolicy(agent.session, policy);
+  }
+
+  async configureSuperagentSession(sessionId: string): Promise<void> {
+    const entry = await this.index.get(sessionId);
+    const agent = this.ctx.agents.get(SessionId(sessionId));
+    if (!entry?.managed || !agent) throw new Error('Super-agent 会话不可用。');
+    await this.syncSuperagentPermissions(agent, entry);
+  }
+
+  async superagentWorkspace(owner: ChannelOwner): Promise<string> {
+    const entry = await this.validateSuperagentOwner(owner);
+    const agent = (await this.operations.acquire(entry.binding)).agent;
+    const cwd = agent.session.header.cwd;
+    if (!cwd) throw new Error('渠道工作目录不可用。');
+    const optional = this.ctx as unknown as { get(name: string): { assertReadable?(path: string, cwd: string): void; historyIsolation?: boolean } | undefined };
+    const guard = optional.get('channelHistoryGuard');
+    if (!guard?.assertReadable || !optional.get('sandbox')?.historyIsolation) throw new Error('渠道历史保护未就绪。');
+    guard.assertReadable(cwd, cwd);
+    return join(cwd, 'superagent');
+  }
+
+  async readSuperagentAttachment(owner: ChannelOwner, sourceSessionId: string, attachmentId: string,
+    offset: number, limit: number, signal: AbortSignal): Promise<unknown> {
+    await this.validateSuperagentAttachmentSource(owner, sourceSessionId);
+    if (!this.operations.readAttachment) throw new Error('渠道附件文本服务不可用。');
+    return this.operations.readAttachment(attachmentId, sourceSessionId, offset, limit, signal);
+  }
+
+  async resolveSuperagentAttachment(owner: ChannelOwner, sourceSessionId: string, attachmentId: string): Promise<ResolvedChannelAttachment> {
+    await this.validateSuperagentAttachmentSource(owner, sourceSessionId);
+    if (!this.operations.resolveAttachment) throw new Error('渠道附件服务不可用。');
+    return this.operations.resolveAttachment(attachmentId, sourceSessionId);
+  }
+
+  private async validateSuperagentAttachmentSource(owner: ChannelOwner, sourceSessionId: string): Promise<void> {
+    const entry = await this.validateSuperagentOwner(owner);
+    const source = await this.index.get(sourceSessionId);
+    if (!source || source.routine || source.managed || !sameOwner(entry.binding, source.binding)
+        || !await this.operations.ownerAuthorized?.(source.binding)) throw new Error('附件来源不属于当前所有者。');
+  }
+
+  async usesIsolatedSuperagentAttachments(sessionId: string): Promise<boolean> {
+    if (!(await this.index.get(sessionId))?.superagent) return false;
+    return this.superagentHandler?.isolateAttachments === true || !!(this.ctx as unknown as { get(name: string): unknown }).get('personalIsolation');
+  }
+
+  async receiveSuperagent(agent: Agent, messageId: string, message: UserMessage, attachmentIds: string[] = [],
+    isCurrent: () => boolean = () => true, imageIds?: string[]): Promise<boolean> {
+    if (!isCurrent()) return true;
+    const entry = await this.index.get(String(agent.id));
+    if (!isCurrent()) return true;
+    if (!entry?.superagent) return false;
+    const owner = await this.ownerForAgent(agent);
+    await this.validateSuperagentOwner(owner);
+    if (!isCurrent()) return true;
+    if (!this.superagentHandler) throw new Error('Super-agent 服务不可用，请稍后重试或使用 /super off。');
+    await this.superagentHandler.receive({ owner, sessionId: String(agent.id), messageId, message, attachmentIds, isCurrent,
+      ...(imageIds?.length ? { imageIds } : {}) });
+    return true;
+  }
+
+  async stopSuperagent(agent: Agent): Promise<boolean> {
+    const entry = await this.index.get(String(agent.id));
+    return entry ? this.stopSuperagentBinding(entry.binding) : false;
+  }
+
+  async stopSuperagentBinding(binding: SessionBinding): Promise<boolean> {
+    const entry = await this.index.get(binding.sessionId);
+    if (!entry?.superagent || !sameOwner(entry.binding, binding)) return false;
+    const owner = { key: ownerKey(entry.binding), sessionId: entry.binding.sessionId };
+    await this.validateSuperagentOwner(owner);
+    if (!this.superagentHandler) throw new Error('Super-agent 服务不可用，无法确认后台任务已停止。');
+    await this.superagentHandler.stop(owner);
+    return true;
   }
   registerRoutineHandler(handler: ChannelRoutineHandler): () => void {
     if (this.routineHandler) throw new Error('定时简报处理器已注册。');
@@ -301,20 +491,32 @@ export class ChannelSessionControl extends Service {
       if ('delivered' in result && result.delivered === false) throw new Error('渠道未确认发送。');
     };
   }
-  async withCommandReply<T>(agent: Agent, register: (message: UserMessage) => void, run: () => Promise<T>): Promise<T> {
-    const scope = { agent, active: true, register };
+  async withCommandReply<T>(agent: Agent, register: (message: UserMessage) => void, run: () => Promise<T>,
+    isCurrent: () => boolean = () => true): Promise<T> {
+    const scope = { agent, active: true, register, isCurrent };
     try { return await this.commandReply.run(scope, run); }
     finally { scope.active = false; }
   }
-  submitFromCommand(agent: Agent, message: UserMessage): void {
+  async submitFromCommand(agent: Agent, message: UserMessage, signal?: AbortSignal): Promise<void> {
     const scope = this.commandReply.getStore();
-    if (scope?.active && scope.agent === agent) scope.register(message);
+    if (this.automaticRouter) await this.prepareAutomaticRoute(agent, message, signal);
+    signal?.throwIfAborted();
+    if (scope?.agent === agent) {
+      if (!scope.active || !scope.isCurrent()) return;
+      scope.register(message);
+    }
     agent.followup(message);
   }
-  registerAutomaticRouter(): () => void {
-    this.automaticRouters++;
-    let disposed = false;
-    return () => { if (!disposed) { disposed = true; this.automaticRouters--; } };
+  registerAutomaticRouter(prepare: NonNullable<ChannelSessionControl['automaticRouter']>): () => void {
+    this.automaticRouter = prepare;
+    return () => { if (this.automaticRouter === prepare) this.automaticRouter = undefined; };
+  }
+  async prepareAutomaticRoute(agent: Agent, message: UserMessage, signal?: AbortSignal): Promise<void> {
+    try {
+      await this.automaticRouter?.(agent, message, signal);
+    } catch (error) {
+      this.ctx.logger.warn('unable to prepare channel model', error);
+    }
   }
   async getModelPolicy(id: string): Promise<SessionModelPolicy | undefined> { return (await this.index.get(id))?.modelPolicy; }
   async setModelPolicy(id: string, policy: SessionModelPolicy): Promise<void> { await this.index.update(id, { modelPolicy: policy }); }
@@ -401,6 +603,39 @@ export class ChannelSessionControl extends Service {
     const input = rawInput.trim();
     const current = await this.current(agent);
     switch (name) {
+      case 'super': {
+        if (!input || input === 'status') return `Super-agent：${current.superagent ? '开启' : '关闭'}`;
+        if (input === 'off') {
+          if (current.superagent && this.superagentHandler) {
+            const owner = await this.ownerForAgent(agent);
+            await this.superagentHandler.cancelPending(owner);
+          }
+          await this.index.update(String(agent.id), { superagent: false });
+          return '已切回普通聊天；已接的后台任务继续执行。';
+        }
+        if (input.startsWith('confirm ')) {
+          if (!current.superagent) throw new Error('请先使用 /super on 开启 Super-agent。');
+          const owner = await this.ownerForAgent(agent);
+          await this.validateSuperagentOwner(owner);
+          if (!this.superagentHandler) throw new Error('Super-agent 服务不可用。');
+          const isCurrent = this.commandReply.getStore()?.isCurrent ?? (() => true);
+          return this.superagentHandler.confirm(owner, input.slice('confirm '.length).trim(), isCurrent);
+        }
+        if (input !== 'on') throw new Error('用法：/super on|off|status|confirm <确认码>');
+        const owner = await this.ownerForAgent(agent);
+        await this.validateSuperagentOwner(owner);
+        if (!this.superagentHandler) throw new Error('Super-agent 服务不可用。');
+        await this.superagentHandler.ready(owner);
+        if (!current.superagent) await this.superagentHandler.cancelPending(owner);
+        await this.index.update(String(agent.id), { superagent: true });
+        return '已开启 Super-agent。';
+      }
+      case 'tasks': case 'task': {
+        const owner = await this.ownerForAgent(agent);
+        await this.validateSuperagentOwner(owner);
+        if (!this.superagentHandler) throw new Error('Super-agent 服务不可用。');
+        return this.superagentHandler.command(owner, name, input);
+      }
       case 'new': return this.create(agent, input, false);
       case 'session': case 'status': return this.describe(agent, current);
       case 'sessions': {
@@ -492,7 +727,7 @@ export class ChannelSessionControl extends Service {
         setSandboxMode(agent.session, 'read-only');
         plan.set(agent, true);
         await this.ctx.get('sessions')?.flush(agent.session);
-        if (input) this.submitFromCommand(agent, createUserMessage({ content: [{ type: 'text', text: input }], source: { kind: 'user' } }));
+        if (input) await this.submitFromCommand(agent, createUserMessage({ content: [{ type: 'text', text: input }], source: { kind: 'user' } }), signal);
         return '已进入只读规划模式。/execute 执行计划；/plan off 仅退出。';
       }
       case 'execute':
@@ -504,7 +739,7 @@ export class ChannelSessionControl extends Service {
         await this.leavePlan(agent);
         await this.index.update(String(agent.id), { planStartOffset: undefined });
         if (current.kind === 'goal' && this.requireGoals().get(agent)) return this.execute('goal', { ...invocation, rawInput: 'resume' });
-        this.submitFromCommand(agent, createUserMessage({ content: [{ type: 'text', text: '按当前会话中已提出的计划执行并验证结果。' }], source: { kind: 'user' } }));
+        await this.submitFromCommand(agent, createUserMessage({ content: [{ type: 'text', text: '按当前会话中已提出的计划执行并验证结果。' }], source: { kind: 'user' } }), signal);
         return '已开始执行当前计划。';
       case 'compact': {
         if (input) throw new Error('用法：/compact');

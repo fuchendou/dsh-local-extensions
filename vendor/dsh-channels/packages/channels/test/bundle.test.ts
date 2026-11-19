@@ -264,9 +264,9 @@ describe('optional generic-file package boundary', () => {
       // copy cannot register with the host registry that executes the tool.
       expect(manifest.dependencies).not.toHaveProperty('@deepseek-ai/dsh-tools');
       // Tested compatibility band: exact pin (no wide prerelease range).
-      expect(manifest.peerDependencies?.['@deepseek-ai/dsh-tools']).toBe('0.2.1-rc.5');
+      expect(manifest.peerDependencies?.['@deepseek-ai/dsh-tools']).toBe('0.2.2-rc.5');
       expect(manifest.peerDependenciesMeta?.['@deepseek-ai/dsh-tools']?.optional).toBe(true);
-      expect(manifest.devDependencies?.['@deepseek-ai/dsh-tools']).toBe('0.2.1-rc.5');
+      expect(manifest.devDependencies?.['@deepseek-ai/dsh-tools']).toBe('0.2.2-rc.5');
     }
   });
 

@@ -32,7 +32,7 @@ export class ChannelFileService extends Service implements ChannelAttachmentProv
 
   store(context: ChannelAttachmentContext, part: StoredBinaryPart) {
     return storeBinaryPart(this.storeBackend, context, part, {
-      extractor: this.extractor,
+      ...(context.deferExtraction ? {} : { extractor: this.extractor }),
     });
   }
 
@@ -89,6 +89,17 @@ export class ChannelFileService extends Service implements ChannelAttachmentProv
     return resolveAttachment(attachmentId, sessionId, this.storeBackend, {
       policy: DEFAULT_ATTACHMENT_POLICY,
     });
+  }
+
+  async readExtracted(attachmentId: string, sessionId: string, offset: number, limit: number, signal: AbortSignal) {
+    const asset = await this.storeBackend.get(attachmentId);
+    if (!asset || asset.sessionId !== sessionId) throw new Error('附件不存在或不属于当前会话。');
+    if (asset.extraction.status !== 'ready') return { attachmentId, name: asset.name, readable: false, text: '', nextOffset: null };
+    const text = await this.storeBackend.readExtracted(attachmentId, { maxBytes: DEFAULT_ATTACHMENT_POLICY.extract.maxOutputBytes, signal }) ?? '';
+    const start = Math.max(0, Math.floor(offset));
+    const end = Math.min(text.length, start + Math.max(1, Math.min(8000, Math.floor(limit))));
+    return { attachmentId, name: asset.name, readable: true, offset: start, totalChars: text.length,
+      text: text.slice(start, end), nextOffset: end < text.length ? end : null };
   }
 }
 

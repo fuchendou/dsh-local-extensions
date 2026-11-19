@@ -1,6 +1,6 @@
 {
   "name": "dsh-channels",
-  "version": "0.5.2-personalai.1",
+  "version": "0.5.2-personalai.2",
   "private": true,
   "description": "Connect WeChat, QQ, DingTalk, Lark and Telegram to DeepSeek Harness — unified config, QR-code auth, chat with your Agent from IM",
   "type": "module",
@@ -10,10 +10,14 @@
   "packageManager": "pnpm@9.15.3",
   "pnpm": {
     "overrides": {
-      "@deepseek-ai/dsh-sandbox": "0.2.1-rc.5",
-      "@deepseek-ai/cordis": "~4.0.5",
-      "@deepseek-ai/schemastery": "~3.18.5",
-      "@deepseek-ai/cordis-plugin-include": "~1.0.10"
+      "@deepseek-ai/dsh-sandbox": "0.2.2-rc.5",
+      "@deepseek-ai/cordis": "~4.1.0",
+      "@deepseek-ai/schemastery": "~3.19.0",
+      "@deepseek-ai/cordis-plugin-include": "1.1.0",
+      "@deepseek-ai/cordis-plugin-loader": "1.1.0",
+      "@deepseek-ai/cordis-plugin-group": "1.1.0",
+      "@deepseek-ai/dsh-working-directory": "0.2.2-rc.5",
+      "@deepseek-ai/dsh-launch-environment": "0.2.2-rc.5"
     }
   },
   "scripts": {

@@ -1,7 +1,7 @@
 # DSH Bundle patch — dsh-smart-router
 #
 # 挂载智能路由插件：入站消息自动分类（任务类型/复杂度/置信度），
-# 在 agent/request waterfall 中把本轮 LLM 调用改写到映射的模型。
+# 在消息入队前准备分类结果，认领时选择映射到的模型。
 # 映射表与分类后端在 index.js DEFAULTS 中，可通过本层 config 覆盖：
 #
 # - insert:

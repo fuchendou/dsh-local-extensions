@@ -1,6 +1,6 @@
 {
   "name": "@wsz987/channel-web",
-  "version": "0.5.2-personalai.2",
+  "version": "0.5.2-personalai.3",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/wsz987/dsh-channels.git"
@@ -51,11 +51,11 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-slots": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-primitives": "0.2.1-rc.5",
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.2-rc.5",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.1",
     "esbuild": "^0.28.2",
@@ -63,12 +63,12 @@
     "rimraf": "^6.0.0",
     "typescript": "^5.9.0",
     "vitest": "^3.2.0",
-    "@deepseek-ai/cordis-plugin-include": "1.0.10"
+    "@deepseek-ai/cordis-plugin-include": "1.1.0"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/dsh-client-locale": "0.2.1-rc.5",
-    "@deepseek-ai/dsh-client-ui-settings": "0.2.1-rc.5"
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.5"
   },
   "license": "MIT"
 }

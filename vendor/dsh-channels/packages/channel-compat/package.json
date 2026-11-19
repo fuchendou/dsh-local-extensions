@@ -33,14 +33,14 @@
   },
   "dependencies": {
     "@wsz987/channel-core": "workspace:*",
-    "@deepseek-ai/cordis": "~4.0.5",
-    "@deepseek-ai/schemastery": "~3.18.5",
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/schemastery": "~3.19.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@wsz987/channel-testkit": "workspace:*",
     "rimraf": "^6.0.0",
-    "@deepseek-ai/cordis-plugin-include": "1.0.10"
+    "@deepseek-ai/cordis-plugin-include": "1.1.0"
   },
   "license": "MIT"
 }

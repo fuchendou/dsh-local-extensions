@@ -44,7 +44,7 @@ function makeSink(accepted = true): { sink: QuestionInteractionSink } & SinkReco
 function setup(accepted = true) {
   const rootCtx = new Context();
   const userQuestions = new UserQuestionService(rootCtx);
-  const liveAgent = { id: SessionId('session-1') };
+  const liveAgent = { id: SessionId('session-1'), session: { header: {} } };
   rootCtx.provide('agents', {
     get: (id: unknown) => (String(id) === 'session-1' ? liveAgent : undefined),
     roots: (): unknown[] => [liveAgent],
@@ -102,7 +102,7 @@ describe('WaterfallQuestionBackend (official user-questions waterfall)', () => {
   it('claims an ask ahead of an already-registered Remote/Web answerer (boot-order race)', async () => {
     const rootCtx = new Context();
     const userQuestions = new UserQuestionService(rootCtx);
-    const liveAgent = { id: SessionId('session-1') };
+    const liveAgent = { id: SessionId('session-1'), session: { header: {} } };
     rootCtx.provide('agents', {
       get: (id: unknown) => (String(id) === 'session-1' ? liveAgent : undefined),
       roots: (): unknown[] => [liveAgent],
@@ -134,7 +134,7 @@ describe('WaterfallQuestionBackend (official user-questions waterfall)', () => {
   it('still reaches a later Remote/Web answerer when the channel declines', async () => {
     const rootCtx = new Context();
     const userQuestions = new UserQuestionService(rootCtx);
-    const liveAgent = { id: SessionId('session-1') };
+    const liveAgent = { id: SessionId('session-1'), session: { header: {} } };
     rootCtx.provide('agents', {
       get: (id: unknown) => (String(id) === 'session-1' ? liveAgent : undefined),
       roots: (): unknown[] => [liveAgent],
@@ -188,7 +188,7 @@ describe('WaterfallQuestionBackend (official user-questions waterfall)', () => {
   it('disposes the waterfall listener and rejects every open ask on stop()', async () => {
     const rootCtx = new Context();
     const userQuestions = new UserQuestionService(rootCtx);
-    const liveAgent = { id: SessionId('session-1') };
+    const liveAgent = { id: SessionId('session-1'), session: { header: {} } };
     rootCtx.provide('agents', {
       get: (id: unknown) => (String(id) === 'session-1' ? liveAgent : undefined),
       roots: (): unknown[] => [liveAgent],

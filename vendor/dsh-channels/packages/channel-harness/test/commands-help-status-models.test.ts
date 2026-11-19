@@ -87,6 +87,7 @@ interface HsmFakeAgent {
   };
   status: 'idle' | 'running';
   options: { provider?: string; model?: string };
+  model: { current(): unknown; select(selection: unknown): void };
   cancel: ReturnType<typeof vi.fn>;
   ctx: Context;
   followup(message: unknown): void;
@@ -95,6 +96,7 @@ interface HsmFakeAgent {
 
 function fakeScopedAgent(ctx: Context, id: string): HsmFakeAgent {
   const events: HsmFakeAgent['session']['events'] = [];
+  let chosen: unknown;
   const agent: HsmFakeAgent = {
     id: SessionId(id),
     session: {
@@ -108,6 +110,11 @@ function fakeScopedAgent(ctx: Context, id: string): HsmFakeAgent {
     },
     status: 'idle',
     options: {},
+    model: {
+      current: () => chosen ?? agent.session.requestHeader?.()?.config
+        ?? (agent.options.provider && agent.options.model ? { ...agent.options } : undefined),
+      select: value => { chosen = value; },
+    },
     cancel: vi.fn(),
     ctx: new Context(),
     followup: () => {},

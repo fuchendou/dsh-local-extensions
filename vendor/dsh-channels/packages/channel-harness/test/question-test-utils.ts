@@ -166,7 +166,7 @@ export function setupPresenter(options: {
   });
   const rootCtx = new Context();
   const userQuestions = new UserQuestionService(rootCtx);
-  const liveAgent = { id: SessionId('session-1') };
+  const liveAgent = { id: SessionId('session-1'), session: { header: {} } };
   rootCtx.provide('agents', {
     get: (id: unknown) => (String(id) === 'session-1' ? liveAgent : undefined),
     roots: (): unknown[] => [liveAgent],

@@ -2,11 +2,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Context } from '@deepseek-ai/cordis';
 import CommandRuntime from '@deepseek-ai/dsh-commands';
 import SessionStore, { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session';
-import { AgentRegistry, type Agent, type AgentSetup } from '@deepseek-ai/dsh-agent';
+import { AgentRegistry, agentEvents, type Agent, type AgentSetup, type ModelSelection } from '@deepseek-ai/dsh-agent';
 import { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection';
 import GoalService from '@deepseek-ai/dsh-goal';
 import { createScope, scopeTarget } from '@deepseek-ai/dsh-scope';
 import { MessageId } from '@deepseek-ai/dsh-llm';
+import { setSandboxMode } from '@deepseek-ai/dsh-sandbox-policy';
+import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval';
 import { AgentManager, type AgentGateway, type GatewayAgentHandle } from '../src/agent-manager.ts';
 import { AgentRouter } from '../src/agent-router.ts';
 import { MemoryBindingStore } from '../src/binding-store.ts';
@@ -21,14 +23,32 @@ import type { MessageReceived } from '@wsz987/channel-core';
 const disposers: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const dispose of disposers.splice(0)) await dispose(); });
 
-function fixture(startControl = true, reply?: { maxTextLength?: number; finalFlush?: boolean }) {
+function testModel(initial: ModelSelection) {
+  let current = initial;
+  return { current: () => current, select: (selection: ModelSelection) => { current = selection; } };
+}
+
+function selectOnClaim(ctx: Context, agent: Agent) {
+  agentEvents(ctx, agent).emit('agent/inbox/claimed', { message: { id: MessageId('mock-selected') } as never, turn: 1 });
+  return agent.model.current();
+}
+
+async function fixture(startControl = true, reply?: { maxTextLength?: number; finalFlush?: boolean }) {
   const ctx = new Context();
+  ctx.provide('channelHistoryGuard' as never, { assertReadable: () => {} } as never);
+  ctx.provide('sandbox' as never, { historyIsolation: true } as never);
   new CommandRuntime(ctx);
   const store = new SessionStore(ctx);
+  ctx.provide('sandboxPolicy', { resolve: ({ session }: { session: ReturnType<SessionStore['create']> }) => ({
+    mode: session.snapshotEvents().filter(event => event.type === 'sandbox/mode').at(-1)?.data.mode ?? 'workspace-write',
+  }) } as never);
+  ctx.provide('approval', { config: { policy: 'ask' }, overrideOf: (session: ReturnType<SessionStore['create']>) =>
+    session.snapshotEvents().filter(event => event.type === 'approval/policy').at(-1)?.data.policy } as never);
   ctx.on('session/flush', async () => {});
   const agents = new AgentRegistry(ctx);
-  new SessionProjectionRegistry(ctx);
-  const goals = new GoalService(ctx);
+  await ctx.plugin(SessionProjectionRegistry).await();
+  await ctx.plugin(GoalService).await();
+  const goals = ctx.goals;
   const defaults = { provider: 'mock', model: 'default' };
   const saveDefault = vi.fn();
   ctx.provide('agentDefaultModel', { currentSelection: () => defaults, saveSelection: saveDefault } as never);
@@ -45,13 +65,13 @@ function fixture(startControl = true, reply?: { maxTextLength?: number; finalFlu
   const retired: string[] = [];
   async function make(id: string, setup?: AgentSetup): Promise<GatewayAgentHandle> {
     const session = store.get(SessionId(id)) ?? store.create(SessionId(id), { meta: { cwd: '/tmp/channel-shared' } });
-    const agent = { id: SessionId(id), session, status: 'idle', options: defaults,
+    const agent = { id: SessionId(id), session, status: 'idle', options: defaults, model: testModel(defaults),
       ctx: new Context(), inbox: { nextStep: [], nextTurn: [] },
       cancel: vi.fn(), followup: (message: unknown) => followups.push({ id, message }),
       whenIdle: async () => {},
     } as unknown as Agent;
     agent.ctx = createScope(ctx, agent).ctx;
-    const unregister = agents.register(agent);
+    const unregister = await agents.register(agent);
     if (setup) { const commit = await setup(agent.ctx, agent); commit?.commit(); }
     const handle = { id, agent, followup: (message: unknown) => agent.followup(message as never),
       whenIdle: async () => {}, dispose: async () => { retired.push(id); live.delete(id); unregister(); } };
@@ -76,6 +96,7 @@ function fixture(startControl = true, reply?: { maxTextLength?: number; finalFlu
   const control = new ChannelSessionControl(ctx, index, bindings, {
     create: (agent, background) => bridge.createSessionFor(agent, background), acquire: binding => bridge.acquireSession(binding),
     events: async id => store.get(SessionId(id))!.snapshotEvents(), authorized: async () => access.allowed,
+    ownerAuthorized: async () => access.allowed,
     adapter: () => adapter as never,
     replyContext: (id, turn) => replyContexts.getTurn(id, turn),
   });
@@ -108,8 +129,84 @@ function appendPlan(session: ReturnType<SessionStore['create']>, turn: number, r
 }
 
 describe('managed channel conversations', () => {
+  it('routes enabled messages once and fails closed when the handler is unavailable', async () => {
+    const f = await fixture();
+    await f.send('原会话');
+    const handler = { ready: vi.fn(async () => {}), receive: vi.fn(async () => {}), confirm: vi.fn(async () => '已确认'),
+      cancelPending: vi.fn(async () => {}), command: vi.fn(async () => '任务列表'), stop: vi.fn(async () => {}) };
+    const unregister = f.control.registerSuperagentHandler(handler);
+    expect(await f.send('/super on')).toContain('已开启');
+    await f.send('整理材料');
+    expect(handler.receive).toHaveBeenCalledOnce();
+    expect(f.followups).toHaveLength(1);
+    expect(await f.send('/tasks')).toBe('任务列表');
+    expect(await f.send('/super confirm 12345678')).toBe('已确认');
+    expect(handler.confirm).toHaveBeenCalledOnce();
+    expect(await f.send('/stop')).toContain('已停止 Super-agent');
+    expect(handler.stop).toHaveBeenCalledOnce();
+    expect(await f.control.stopSuperagentBinding(await f.active())).toBe(true);
+    expect(handler.stop).toHaveBeenCalledTimes(2);
+    await f.manager.retireSession((await f.active()).sessionId);
+    expect(await f.send('/stop')).toContain('已停止 Super-agent');
+    expect(handler.stop).toHaveBeenCalledTimes(3);
+    unregister();
+    expect(await f.send('另一条消息')).toContain('服务不可用');
+    expect(f.followups).toHaveLength(1);
+    expect(await f.send('/super off')).toContain('普通聊天');
+    await f.send('普通聊天');
+    expect(f.followups).toHaveLength(2);
+  });
+
+  it('registers managed sessions atomically and rechecks owner authorization', async () => {
+    const f = await fixture();
+    await f.send('原会话');
+    const binding = await f.active();
+    const owner = await f.control.ownerForAgent(f.agents.get(SessionId(binding.sessionId))!);
+    await f.control.registerSuperagentSession(owner, 'worker-test', 'worker', 'ticket-1');
+    expect((await f.index.get('worker-test'))?.managed).toEqual({ ownerSessionId: owner.sessionId, role: 'worker', ticketId: 'ticket-1' });
+    expect((await f.index.list(binding)).map(entry => entry.binding.sessionId)).not.toContain('worker-test');
+    await expect(f.control.registerSuperagentSession(owner, 'worker-test', 'worker', 'ticket-2')).rejects.toThrow('归属冲突');
+    f.access.allowed = false;
+    await expect(f.control.registerSuperagentSession(owner, 'worker-other', 'worker', 'ticket-2')).rejects.toThrow('权限');
+  });
+
+  it('inherits the owner sandbox and approval policy and refreshes changes', async () => {
+    const f = await fixture();
+    await f.send('原会话');
+    const binding = await f.active();
+    const source = f.agents.get(SessionId(binding.sessionId))!;
+    const owner = await f.control.ownerForAgent(source);
+    const manual = { mode: 'manual' as const, selection: { provider: 'mock', model: 'chosen' } };
+    await f.control.setModelPolicy(String(source.id), manual);
+    await f.control.registerSuperagentSession(owner, 'worker-policy', 'worker', 'ticket-policy', true);
+    await f.control.registerSuperagentSession(owner, 'router-policy', 'router');
+    expect((await f.index.get('worker-policy'))?.modelPolicy).toEqual(manual);
+    expect((await f.index.get('router-policy'))?.modelPolicy).toEqual({ mode: 'auto' });
+    const session = f.store.create(SessionId('worker-policy'), { meta: { cwd: '/tmp/channel-shared/superagent' } });
+    const agent = { id: SessionId('worker-policy'), session, ctx: new Context(),
+      model: testModel({ provider: 'role', model: 'configured' }) } as Agent;
+    agent.ctx = createScope(f.ctx, agent).ctx;
+    const unregister = await f.agents.register(agent);
+    const request = () => selectOnClaim(f.ctx, agent);
+    expect(await request()).toMatchObject({ provider: 'mock', model: 'chosen' });
+    await f.control.setModelPolicy('worker-policy', { mode: 'auto' });
+    expect(await request()).toMatchObject({ provider: 'role', model: 'configured' });
+    setSandboxMode(source.session, 'read-only');
+    setApprovalPolicy(source.session, 'never');
+    await f.control.configureSuperagentSession('worker-policy');
+    expect(f.ctx.sandboxPolicy.resolve({ session }).mode).toBe('read-only');
+    expect(f.ctx.approval.overrideOf(session)).toBe('never');
+    setSandboxMode(source.session, 'workspace-write');
+    setApprovalPolicy(source.session, 'ask');
+    await f.control.configureSuperagentSession('worker-policy');
+    expect(f.ctx.sandboxPolicy.resolve({ session }).mode).toBe('workspace-write');
+    expect(f.ctx.approval.overrideOf(session)).toBe('ask');
+    f.access.allowed = false;
+    await expect(f.control.configureSuperagentSession('worker-policy')).rejects.toThrow('权限');
+    unregister();
+  });
   it('creates an owned background routine without changing the active conversation', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('原会话');
     const original = await f.active();
     const agent = f.agents.get(SessionId(original.sessionId))!;
@@ -129,7 +226,7 @@ describe('managed channel conversations', () => {
   });
 
   it('admits only registered schedule work and preserves a manual routine model', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('原会话');
     const owner = await f.control.ownerForAgent(f.agents.get(SessionId((await f.active()).sessionId))!);
     const id = await f.control.createRoutine(owner);
@@ -152,9 +249,7 @@ describe('managed channel conversations', () => {
     expect(failed).toHaveBeenCalledOnce();
     agent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } });
     expect(failed).toHaveBeenCalledTimes(2);
-    const request = () => agent.ctx.waterfall(scopeTarget(agent, agent), 'agent/request', {
-      agent, turn: 1, step: 0, signal: new AbortController().signal,
-    }, async () => ({ provider: 'default', model: 'default' }));
+    const request = () => selectOnClaim(f.ctx, agent);
     expect(await request()).toMatchObject({ model: 'deepseek-v4-pro', reasoningEffort: 'high' });
     await f.control.configureRoutineModel(owner, id, { provider: 'mock', model: 'deep', reasoningEffort: 'high' });
     expect(await request()).toMatchObject({ model: 'deep', reasoningEffort: 'high' });
@@ -166,7 +261,7 @@ describe('managed channel conversations', () => {
     stop();
   });
   it('delivers presented files only to the originating authorized channel turn', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('请求办公文件');
     const binding = await f.active();
     expect(f.control.fileDeliveryForTurn(binding.sessionId, 42)).toBeUndefined();
@@ -182,7 +277,7 @@ describe('managed channel conversations', () => {
     await expect(deliver({ text: 'notice' })).rejects.toThrow('权限已失效');
   });
   it('renders readable complete help through the channel bridge, including the final split reply', async () => {
-    const f = fixture(true, { maxTextLength: 350, finalFlush: false });
+    const f = await fixture(true, { maxTextLength: 350, finalFlush: false });
     for (const [name, description, hint] of [
       ['permission', 'Switch permissions', '<preset>'],
       ['export', 'Download session', ''],
@@ -217,7 +312,7 @@ describe('managed channel conversations', () => {
   });
 
   it('explains command variants and accepts help names with or without a slash', async () => {
-    const f = fixture();
+    const f = await fixture();
     f.ctx.commands.register({ name: 'export', description: 'Download session', handler: () => ({ kind: 'success', text: 'ok' }) });
     const goal = await f.send('/help goal');
     expect(goal).toBe(await f.send('/help /goal'));
@@ -231,7 +326,7 @@ describe('managed channel conversations', () => {
   });
 
   it('provides detailed help for each of the standard registered commands', async () => {
-    const f = fixture();
+    const f = await fixture();
     for (const name of ['permission', 'export', 'feedback']) {
       f.ctx.commands.register({ name, description: 'Host command', handler: () => ({ kind: 'success', text: 'ok' }) });
     }
@@ -246,7 +341,7 @@ describe('managed channel conversations', () => {
   });
 
   it('keeps managed help localized and reflects live command registration', async () => {
-    const f = fixture();
+    const f = await fixture();
     f.ctx.provide('settings', { get: () => ({ preference: 'en' }) } as never);
     const dispose = f.ctx.commands.register({ name: 'custom', description: 'Custom extension',
       handler: () => ({ kind: 'success', text: 'ok' }) });
@@ -265,7 +360,7 @@ describe('managed channel conversations', () => {
   });
 
   it('shows only registered office and reminder commands with detailed usage', async () => {
-    const f = fixture(true, { maxTextLength: 350, finalFlush: false });
+    const f = await fixture(true, { maxTextLength: 350, finalFlush: false });
     const disposers = ['search', 'documents', 'spreadsheets', 'presentations', 'pdf', 'todo', 'remind', 'reminders'].map(name =>
       f.ctx.commands.register({ name, description: 'extension', handler: () => ({ kind: 'success', text: 'ok' }) }));
     const start = f.sent.length;
@@ -283,7 +378,7 @@ describe('managed channel conversations', () => {
   });
 
   it('new creates a blank session, preserves files and permits owner-scoped switching', async () => {
-    const f = fixture();
+    const f = await fixture();
     expect(await f.send('/new 旧话题')).toContain('旧话题');
     const old = await f.active();
     await f.send('只属于旧会话的随机测试信息');
@@ -306,7 +401,7 @@ describe('managed channel conversations', () => {
   });
 
   it('manual model and effort stay in the current session and never save global defaults', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new');
     const id = (await f.active()).sessionId;
     expect(await f.send('/model mock deep high')).toContain('已锁定');
@@ -324,7 +419,7 @@ describe('managed channel conversations', () => {
   });
 
   it('goal creates an independent native goal and remains alive when the foreground changes', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new 普通聊天');
     const original = await f.active();
     expect(await f.send('/goal')).toContain('下一条需求');
@@ -348,7 +443,7 @@ describe('managed channel conversations', () => {
   });
 
   it('terminal goal notifications preserve the original recipient and deduplicate events', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new');
     await f.send('/goal 完成任务');
     const task = await f.active();
@@ -365,7 +460,7 @@ describe('managed channel conversations', () => {
   });
 
   it('first-message goal creates only one session and stop persists a paused intent', async () => {
-    const f = fixture();
+    const f = await fixture();
     expect(await f.send('/goal 独立任务')).toContain('自主推进');
     expect(await f.index.all()).toHaveLength(1);
     const binding = await f.active();
@@ -376,7 +471,7 @@ describe('managed channel conversations', () => {
   });
 
   it('planning applies a read-only policy, restores it on exit and reports compaction failures', async () => {
-    const f = fixture();
+    const f = await fixture();
     let active = false;
     f.ctx.provide('planMode', { get: () => ({ active }), set: (_agent: Agent, value: boolean) => { active = value; return 'committed'; } } as never);
     const compactNow = vi.fn(async () => ({ shadowedSeqs: [1, 2], shadowedTokenCount: 300 }));
@@ -400,7 +495,7 @@ describe('managed channel conversations', () => {
   });
 
   it('rejects execution until a completed plan exists and preserves it across plan off', async () => {
-    const f = fixture();
+    const f = await fixture();
     let active = false;
     f.ctx.provide('planMode', { get: () => ({ active }), set: (_agent: Agent, value: boolean) => { active = value; return 'committed'; } } as never);
     await f.send('/new');
@@ -417,7 +512,7 @@ describe('managed channel conversations', () => {
   });
 
   it('binds command-started model turns to the requesting channel message', async () => {
-    const f = fixture();
+    const f = await fixture();
     let active = false;
     f.ctx.provide('planMode', { get: () => ({ active }), set: (_agent: Agent, value: boolean) => { active = value; return 'committed'; } } as never);
     await f.send('/new');
@@ -433,22 +528,22 @@ describe('managed channel conversations', () => {
   });
 
   it('keeps concurrent command reply scopes separate and never binds later Web work', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new');
     const agent = f.agents.get(SessionId((await f.active()).sessionId))!;
     const seen: string[] = [];
     const first = { id: 'first' } as never;
     const second = { id: 'second' } as never;
     await Promise.all([
-      f.control.withCommandReply(agent, () => seen.push('first'), async () => { await Promise.resolve(); f.control.submitFromCommand(agent, first); }),
-      f.control.withCommandReply(agent, () => seen.push('second'), async () => { await Promise.resolve(); f.control.submitFromCommand(agent, second); }),
+      f.control.withCommandReply(agent, () => seen.push('first'), async () => { await f.control.submitFromCommand(agent, first); }),
+      f.control.withCommandReply(agent, () => seen.push('second'), async () => { await f.control.submitFromCommand(agent, second); }),
     ]);
-    f.control.submitFromCommand(agent, { id: 'web' } as never);
+    await f.control.submitFromCommand(agent, { id: 'web' } as never);
     expect(seen).toEqual(['first', 'second']);
   });
 
   it('explains Web-only export and prevents unsafe permission changes', async () => {
-    const f = fixture();
+    const f = await fixture();
     let active = false;
     const set = vi.fn();
     f.ctx.provide('planMode', { get: () => ({ active }), set: (_agent: Agent, value: boolean) => { active = value; return 'committed'; } } as never);
@@ -469,7 +564,7 @@ describe('managed channel conversations', () => {
   });
 
   it('resolves and rechecks reminder ownership without following the current binding', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new 提醒来源');
     const original = await f.active();
     const owner = await f.control.ownerForAgent(f.agents.get(SessionId(original.sessionId))!);
@@ -483,7 +578,7 @@ describe('managed channel conversations', () => {
   });
 
   it('resolves planning and compaction from the owning agent preset', async () => {
-    const f = fixture();
+    const f = await fixture();
     let active = false;
     const plan = { get: () => ({ active }), set: (_agent: Agent, value: boolean) => { active = value; return 'committed'; } };
     const compactNow = vi.fn(async () => ({ shadowedSeqs: [1], shadowedTokenCount: 12 }));
@@ -500,7 +595,7 @@ describe('managed channel conversations', () => {
   });
 
   it('does not acknowledge a successful new session when index persistence fails', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/new 原会话');
     const previous = await f.active();
     vi.spyOn(f.index, 'track').mockImplementationOnce(async binding => (await f.index.get(binding.sessionId))!)
@@ -510,7 +605,7 @@ describe('managed channel conversations', () => {
   });
 
   it('keeps failed background delivery pending and retries without resending acknowledged notifications', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/goal 通知测试');
     const binding = await f.active();
     const agent = f.agents.get(SessionId(binding.sessionId))!;
@@ -525,7 +620,7 @@ describe('managed channel conversations', () => {
   });
 
   it('recovers terminal results committed while the notification observer was offline', async () => {
-    const f = fixture(false);
+    const f = await fixture(false);
     await f.send('/goal 重启边界测试');
     const binding = await f.active();
     const agent = f.agents.get(SessionId(binding.sessionId))!;
@@ -540,16 +635,22 @@ describe('managed channel conversations', () => {
   });
 
   it('inherits history and no-question policy through live subagent ownership, not a guessed ID prefix', async () => {
-    const f = fixture();
+    const f = await fixture();
     await f.send('/goal 子任务归属');
     const binding = await f.active();
     const parent = f.agents.get(SessionId(binding.sessionId))!;
     const id = SessionId('delegated-without-channel-prefix');
-    const child = { id, session: f.store.create(id, { meta: { cwd: '/tmp/channel-shared' } }), ctx: new Context() } as Agent;
-    const detach = f.agents.enter(child, parent);
+    const child = { id, session: f.store.create(id, { meta: { cwd: '/tmp/channel-shared', origin: 'subagent' } }), ctx: new Context() } as Agent;
+    const rootOf = vi.fn((agent: Agent) => {
+      if (agent !== child) throw new Error('No live owner');
+      return parent;
+    });
+    f.ctx.provide('subagents', { rootOf } as never);
+    const detach = f.agents.enter(child);
     try {
       expect(f.control.getSessionEntry(String(id))?.binding.sessionId).toBe(binding.sessionId);
       expect(f.control.getSessionEntry(String(id))?.kind).toBe('goal');
+      expect(rootOf).toHaveBeenCalledWith(child);
       expect(f.control.getSessionEntry('unrelated')).toBeUndefined();
     } finally { detach(); }
   });

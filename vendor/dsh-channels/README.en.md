@@ -1,4 +1,4 @@
-> This workspace contains a private `0.5.2-personalai` build for DSH `0.2.1-rc.5` and Node.js >=24.9. The upstream npm `0.5.1` package targets an older DSH version. Use the workspace [deployment guide](../../DEPLOY.md) for installation and rollback.
+> This workspace contains a private `0.5.2-personalai` build for DSH `0.2.2-rc.5` and Node.js >=24.9. The upstream npm `0.5.1` package targets an older DSH version. Use the workspace [deployment guide](../../DEPLOY.md) for installation and rollback.
 
 <div align="center">
 

@@ -1,18 +1,7 @@
 /**
  * dsh-smart-router — 自动任务分类与模型路由（零依赖本地 Cordis 插件）
  *
- * 工作方式：
- *   1. agent/inbox/claimed   消息被 agent 认领时，后台用轻量模型做一次分类
- *                            （task_type / complexity / confidence）
- *   2. agent/request         LLM 调用前的 waterfall，把本轮 provider/model/
- *                            reasoningEffort 改写为映射表中匹配的路由
- *
- * 设计原则：
- *   - fail-open：分类失败、超时、置信度不足 → 一律不改写，走默认模型
- *   - 零依赖：只用 Node 全局 fetch
- *   - 分类后端可切换：deepseek（默认）| jev（TypeSafe System One，预留）
- *
- * 依赖公开的 agent/inbox/claimed 和 agent/request 事件。
+ * 在消息入队前分类，通过 agent/inbox/claimed 同步选择本步模型。
  *
  * 已验证的 provider/model（2026-10）：
  *   - deepseek-official/deepseek-flash   快、支持图片输入（effort low/high/max）
@@ -100,13 +89,64 @@ export function apply(ctx, config) {
     return;
   }
 
-  /** agentId -> { promise: Promise<decision|null>, at: number } */
-  const pending = new Map();
-  const recent = new Map();
-  const visionSessions = new Set();
-  const visionChecked = new Set();
+  const states = new WeakMap();
+  const channelEntry = agent => ctx.get?.('channelSessions')?.getSessionEntry?.(String(agent.id));
+  const defaultSelection = () => ctx.get?.('agentDefaultModel')?.currentSelection();
+
+  function stateFor(agent) {
+    let state = states.get(agent);
+    if (!state) {
+      const history = agent.session?.snapshotEvents?.() ?? [];
+      state = {
+        pending: new Map(),
+        recent: [],
+        vision: history.some(event => event.type === 'user/message'
+          && extractContent(event.data?.message ?? event.data).attachments > 0),
+      };
+      states.set(agent, state);
+    }
+    return state;
+  }
+
+  async function prepare(agent, message, signal) {
+    const entry = channelEntry(agent);
+    if (entry?.managed || entry?.routine || entry?.modelPolicy?.mode === 'manual') return;
+    if (message.source?.kind && !['user', 'goal', 'schedule'].includes(message.source.kind)) return;
+    const { text, attachments } = extractContent(message);
+    const skill = /^\/office-(documents|spreadsheets|presentations|pdf)\s+([\s\S]+)/.exec(text);
+    if ((!text && !attachments) || (text.startsWith('/') && !skill) || signal?.aborted) return;
+
+    const state = stateFor(agent);
+    if (state.manual || state.manualPending) return;
+    const current = skill ? skill[2] : text;
+    const input = `${state.recent.length ? `本会话最近需求（仅作上下文）：\n${state.recent.join('\n')}\n\n` : ''}当前需求：\n`
+      + (attachments ? `[带 ${attachments} 个图片/文件附件] ` : '') + current.slice(0, 4000);
+    const classified = skill
+      ? { task_type: 'doc_writing', complexity: 2, confidence: 1 }
+      : await withTimeout(classify(input, cfg, ctx, signal).catch(error => {
+        if (!signal?.aborted) {
+          logger.warn('classify failed (fail-open):', error?.message ?? error);
+          void logFile(`classify failed: ${error?.message ?? error}`);
+        }
+        return null;
+      }), cfg.classifierTimeoutMs, null);
+    if (signal?.aborted || states.get(agent) !== state) return;
+    state.pending.set(messageKey(message), { classified, current, text, attachments });
+    while (state.pending.size > 256) state.pending.delete(state.pending.keys().next().value);
+  }
+
+  const router = {
+    prepare,
+    discard(agent, message) {
+      states.get(agent)?.pending.delete(messageKey(message));
+    },
+    markManual(agent) {
+      stateFor(agent).manual = true;
+    },
+  };
+  ctx.provide('personalModelRouter', router);
   ctx.inject?.(['channelSessions'], (scope) => {
-    scope.effect(() => scope.get('channelSessions').registerAutomaticRouter());
+    scope.effect(() => scope.get('channelSessions').registerAutomaticRouter(prepare));
   });
   ctx.inject?.(['systemPrompt'], scope => {
     scope.effect(() => scope.systemPrompt.section({ name: 'personalai:answer-quality', order: 205, text: QUALITY_GUIDANCE }));
@@ -114,100 +154,55 @@ export function apply(ctx, config) {
 
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
     try {
-      const agentId = agent ? String(agent.id) : '';
-      if (!agentId) return;
-      pending.delete(agentId);
-      if (message?.source?.kind && !['user', 'goal', 'schedule'].includes(message.source.kind)) return;
-      if (!visionChecked.has(agentId)) {
-        const history = agent.session?.snapshotEvents?.() ?? [];
-        if (history.some(event => event.type === 'user/message' && extractContent(event.data?.message ?? event.data).attachments > 0)) visionSessions.add(agentId);
-        visionChecked.add(agentId);
+      const state = stateFor(agent);
+      const key = messageKey(message);
+      let prepared = state.pending.get(key);
+      state.pending.delete(key);
+      if (prepared) {
+        const { text, attachments } = extractContent(message);
+        if (prepared.text !== text || prepared.attachments !== attachments) prepared = undefined;
       }
-      const { text, attachments } = extractContent(message);
-      if (attachments > 0) visionSessions.add(agentId);
-      if (!text && attachments === 0) return;
-      const skill = /^\/office-(documents|spreadsheets|presentations|pdf)\s+([\s\S]+)/.exec(text);
-      if (text.startsWith('/') && !skill) return;
-      const current = skill ? skill[2] : text;
-      const history = recent.get(agentId) ?? [];
-      const input = `${history.length ? `本会话最近需求（仅作上下文）：\n${history.join('\n')}\n\n` : ''}当前需求：\n`
-        + (attachments > 0 ? `[带 ${attachments} 个图片/文件附件] ` : '') + current.slice(0, 4000);
-      if (message?.source?.kind !== 'schedule') {
-        recent.set(agentId, [...history, current.slice(0, 700)].slice(-3));
-        while (recent.size > 256) recent.delete(recent.keys().next().value);
+      const entry = channelEntry(agent);
+      if (entry?.managed || entry?.routine || entry?.modelPolicy?.mode === 'manual' || state.manual) return;
+      if (!prepared && turn === state.turn) return;
+      state.turn = turn;
+
+      if (prepared) {
+        state.vision ||= prepared.attachments > 0;
+        if (message.source?.kind !== 'schedule') state.recent = [...state.recent, prepared.current.slice(0, 700)].slice(-3);
       }
-      const entry = {
-        turn,
-        attachments: visionSessions.has(agentId) ? Math.max(1, attachments) : 0,
-        promise: Promise.resolve(ctx.get?.('channelSessions')?.getModelPolicy(agentId))
-          .then(policy => {
-            if (policy?.mode === 'manual') return null;
-            if (skill) return { task_type: 'doc_writing', complexity: 2, confidence: 1 };
-            return classify(input, cfg, ctx);
-          }).catch((error) => {
-          logger.warn('classify failed (fail-open):', error?.message ?? error);
-          void logFile(`classify failed: ${error?.message ?? error}`);
-          return null;
-        }),
-        at: Date.now(),
-      };
-      pending.set(agentId, entry);
-      while (pending.size > 256) pending.delete(pending.keys().next().value);
+      const decision = prepared?.classified;
+      const route = decision && decision.confidence >= cfg.minConfidence
+        ? selectRoute(decision, state.vision, cfg) : null;
+      const current = agent.model.current();
+      if (!state.applied || !sameSelection(current, state.applied)) state.baseline = current;
+      const fallback = entry ? defaultSelection() ?? state.baseline : state.baseline ?? defaultSelection();
+      const selected = route ?? fallback;
+      if (selected?.provider && selected.model && !sameSelection(current, selected)) agent.model.select(selected);
+      state.applied = selected;
+      if (route) {
+        const line = `route: type=${decision.task_type} complexity=${decision.complexity} confidence=${decision.confidence}`
+          + ` -> ${route.provider}/${route.model}${route.reasoningEffort ? ` effort=${route.reasoningEffort}` : ''}`;
+        logger.info(line);
+        void logFile(line);
+      }
     } catch (error) {
-      logger.warn('inbox/claimed handler error:', error?.message ?? error);
+      logger.warn('inbox/claimed selection failed (fail-open):', error?.message ?? error);
     }
   });
-
-  ctx.on('agent/request', async (payload, next) => {
-    let resolved = await next();
+  ctx.on('agent/inbox/discarded', ({ agent, message }) => router.discard(agent, message));
+  ctx.on('agent/disposed', ({ agent }) => states.delete(agent));
+  ctx.on('agent/status', ({ agent, status }) => {
+    const state = states.get(agent);
+    if (status !== 'idle' || !state?.applied || !state.baseline || state.manual || channelEntry(agent)) return;
     try {
-      const agent = payload?.agent ?? payload?.turn?.agent;
-      const agentId = agent ? String(agent.id) : '';
-      const policy = await ctx.get?.('channelSessions')?.getModelPolicy(agentId);
-      if (policy?.mode === 'manual') return replaceSelection(resolved, policy.selection);
-      const routine = ctx.get?.('channelSessions')?.getSessionEntry?.(agentId)?.routine;
-      if (routine) return replaceSelection(resolved, routine.selection ?? cfg.depthRoutes.high);
-      if (policy?.mode === 'auto') {
-        const defaults = ctx.get?.('agentDefaultModel')?.currentSelection();
-        if (defaults?.provider && defaults.model) resolved = replaceSelection(resolved, defaults);
-      }
-      const entry = agentId ? pending.get(agentId) : undefined;
-      if (!entry) return resolved;
-      if (entry.turn !== undefined && payload.turn !== undefined && entry.turn !== payload.turn) return resolved;
-      const decision = await withTimeout(entry.promise, cfg.classifierTimeoutMs, null);
-      if (!decision) {
-        logger.info('no-route: classification unavailable, using default model');
-        void logFile('no-route: classification unavailable');
-        return resolved;
-      }
-      if (decision.confidence < cfg.minConfidence) {
-        logger.info(`no-route: confidence ${decision.confidence} < ${cfg.minConfidence}, using default model`);
-        void logFile(`no-route: type=${decision.task_type} confidence=${decision.confidence} below threshold`);
-        return resolved;
-      }
-      const route = selectRoute(decision, entry.attachments > 0, cfg);
-      if (!route) {
-        logger.info(`no-route: task_type=${decision.task_type} maps to default model`);
-        void logFile(`no-route: type=${decision.task_type} uses default model`);
-        return resolved;
-      }
-      const decisionLine =
-        `route: type=${decision.task_type} complexity=${decision.complexity} confidence=${decision.confidence}` +
-        ` -> ${route.provider}/${route.model}${route.reasoningEffort ? ` effort=${route.reasoningEffort}` : ''}`;
-      logger.info(decisionLine);
-      void logFile(decisionLine);
-      // 官方模式：旧模型的 reasoningEffort 不能继承到新模型
-      return replaceSelection(resolved, route);
+      const current = agent.model.current();
+      if (sameSelection(current, state.applied) && !sameSelection(current, state.baseline)) agent.model.select(state.baseline);
+      state.applied = undefined;
     } catch (error) {
-      logger.warn('agent/request handler error (fail-open):', error?.message ?? error);
-      return resolved;
+      logger.warn('unable to restore Web session model:', error?.message ?? error);
     }
   });
-  ctx.on('agent/disposed', ({ agent }) => {
-    const id = String(agent.id);
-    pending.delete(id); recent.delete(id); visionSessions.delete(id); visionChecked.delete(id);
-  });
-
   logger.info(`smart-router ready (backend=${cfg.classifier.backend}, minConfidence=${cfg.minConfidence})`);
   void logFile(`smart-router ready (backend=${cfg.classifier.backend}, minConfidence=${cfg.minConfidence})`);
 }
@@ -227,15 +222,20 @@ export function selectRoute(decision, hasAttachments = false, config) {
   return base;
 }
 
-function replaceSelection(resolved, selection) {
-  const { reasoningEffort: _old, ...rest } = resolved ?? {};
-  return { ...rest, provider: selection.provider, model: selection.model,
-    ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
+function messageKey(message) {
+  return message.source?.kind === 'user' && message.source.rpcId
+    ? `rpc:${message.source.rpcId}` : `message:${message.id}`;
+}
+
+function sameSelection(a, b) {
+  return a?.provider === b?.provider && a?.model === b?.model && a?.reasoningEffort === b?.reasoningEffort;
 }
 
 // ---------- 分类后端 ----------
 
-async function classify(text, cfg, ctx) {
+async function classify(text, cfg, ctx, parentSignal) {
+  const timeout = AbortSignal.timeout(cfg.classifierTimeoutMs);
+  const signal = parentSignal ? AbortSignal.any([parentSignal, timeout]) : timeout;
   if (cfg.classifier.backend === 'harness') {
     const llm = ctx.get?.('llm');
     if (!llm) throw new Error('classification provider is unavailable');
@@ -244,7 +244,7 @@ async function classify(text, cfg, ctx) {
     for await (const chunk of llm.stream({ provider: cfg.classifier.provider, model: cfg.classifier.model,
       reasoningEffort: cfg.classifier.reasoningEffort ?? 'low', maxTokens: 2048,
       system: CLASSIFY_SYSTEM_PROMPT, messages: [{ role: 'user', content: [{ type: 'text', text: text.slice(0, 6500) }] }],
-      signal: AbortSignal.timeout(cfg.classifierTimeoutMs),
+      signal,
     })) {
       if (chunk.type === 'text-delta') { output += chunk.text; if (output.length > 4000) throw new Error('classifier output too long'); }
       if (chunk.type === 'finish') { if (chunk.reason?.kind !== 'stop') throw new Error('classifier output incomplete'); finished = true; }
@@ -252,10 +252,10 @@ async function classify(text, cfg, ctx) {
     if (!finished) return null;
     return normalizeDecision(JSON.parse(output.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')));
   }
-  return cfg.classifier.backend === 'jev' ? classifyJev(text, cfg) : classifyDeepSeek(text, cfg);
+  return cfg.classifier.backend === 'jev' ? classifyJev(text, cfg, signal) : classifyDeepSeek(text, cfg, signal);
 }
 
-async function classifyDeepSeek(text, cfg) {
+async function classifyDeepSeek(text, cfg, signal) {
   const key = process.env[cfg.classifier.apiKeyEnv];
   if (!key) throw new Error(`env ${cfg.classifier.apiKeyEnv} is not set`);
   const url = trimSlash(cfg.classifier.baseURL) + '/chat/completions';
@@ -270,10 +270,10 @@ async function classifyDeepSeek(text, cfg) {
       { role: 'user', content: text.slice(0, 6500) },
     ],
   };
-  let res = await postJson(url, key, { ...base, reasoning_effort: 'low' }, cfg.classifierTimeoutMs);
+  let res = await postJson(url, key, { ...base, reasoning_effort: 'low' }, signal);
   if (res.status === 400) {
     // 端点不认识 reasoning_effort 参数时降级重试
-    res = await postJson(url, key, base, cfg.classifierTimeoutMs);
+    res = await postJson(url, key, base, signal);
   }
   if (!res.ok) throw new Error(`deepseek HTTP ${res.status}`);
   const choice = res.json?.choices?.[0];
@@ -283,7 +283,7 @@ async function classifyDeepSeek(text, cfg) {
 }
 
 // Jev (TypeSafe AI) System One 决策 API：choice 出分类，score 出复杂度
-async function classifyJev(text, cfg) {
+async function classifyJev(text, cfg, signal) {
   const key = process.env[cfg.classifier.jevApiKeyEnv];
   if (!key) throw new Error(`env ${cfg.classifier.jevApiKeyEnv} is not set`);
   const url = trimSlash(cfg.classifier.jevBaseURL) + '/v1/systemone';
@@ -309,7 +309,7 @@ async function classifyJev(text, cfg) {
         criteria: ['极简单，一步直答', '简单，需要少量工具或检索', '较复杂，多步骤或需要分析', '非常复杂，需要深度推理或长文产出'],
       },
     },
-  }, cfg.classifierTimeoutMs);
+  }, signal);
   if (!res.ok) throw new Error(`jev HTTP ${res.status}`);
   const answers = res.json?.answers ?? {};
   return normalizeDecision({
@@ -321,12 +321,12 @@ async function classifyJev(text, cfg) {
 
 // ---------- 工具函数 ----------
 
-async function postJson(url, key, body, timeoutMs) {
+async function postJson(url, key, body, signal) {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
+    signal,
   });
   const bodyText = await res.text().catch(() => '');
   let json = null;

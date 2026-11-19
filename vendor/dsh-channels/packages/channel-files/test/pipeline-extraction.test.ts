@@ -14,6 +14,8 @@ import { FileChannelInboundAssetStore } from '../src/attachments/store.js';
 import { storeBinaryPart } from '../src/attachments/pipeline.js';
 import { createAttachmentExtractor } from '../src/attachments/pipeline-extractor.js';
 import { DEFAULT_ATTACHMENT_POLICY } from '../src/attachments/policy.js';
+import { Context } from '@deepseek-ai/cordis';
+import { ChannelFileService } from '../src/service.js';
 
 async function tempRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'dsh-pipe-'));
@@ -31,6 +33,43 @@ function context(sessionId = 's1') {
 }
 
 describe('pipeline two-phase extraction', () => {
+  it('stores a personal task attachment verbatim when parsing is delegated', async () => {
+    const root = await tempRoot();
+    try {
+      const store = new FileChannelInboundAssetStore({ root });
+      const service = new ChannelFileService(new Context());
+      Object.defineProperty(service, 'storeBackend', { value: store });
+      const data = new TextEncoder().encode('隔离附件');
+      const descriptor = await service.store({ ...context(), deferExtraction: true }, {
+        type: 'file', name: 'source.txt', mimeType: 'text/plain', localData: data,
+      });
+      expect(descriptor?.readable).toBe(false);
+      expect((await store.get(descriptor!.attachmentId))?.extraction.status).toBe('not-needed');
+      expect((await service.resolveAttachment(descriptor!.attachmentId, 's1')).data).toEqual(data);
+      await expect(service.resolveAttachment(descriptor!.attachmentId, 's2')).rejects.toMatchObject({ code: 'ATTACHMENT_ACCESS_DENIED' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('limits extracted text to the originating session and requested page', async () => {
+    const root = await tempRoot();
+    try {
+      const store = new FileChannelInboundAssetStore({ root });
+      const descriptor = await storeBinaryPart(store, context(), {
+        type: 'file', name: 'source.txt', mimeType: 'text/plain', localData: new TextEncoder().encode('hello extractor'),
+      }, { extractor: createAttachmentExtractor(DEFAULT_ATTACHMENT_POLICY) });
+      const service = new ChannelFileService(new Context());
+      Object.defineProperty(service, 'storeBackend', { value: store });
+      const signal = new AbortController().signal;
+      expect(await service.readExtracted(descriptor!.attachmentId, 's1', 6, 4, signal))
+        .toMatchObject({ readable: true, text: 'extr', nextOffset: 10 });
+      await expect(service.readExtracted(descriptor!.attachmentId, 's2', 0, 100, signal)).rejects.toThrow('不属于');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('puts a txt file then extracts it to ready via putExtracted', async () => {
     const root = await tempRoot();
     try {

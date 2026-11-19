@@ -76,10 +76,12 @@ interface ModelAgent {
   };
   status: 'idle' | 'running';
   options: { provider?: string; model?: string };
+  model: { current(): unknown; select(selection: unknown): void };
   ctx: Context;
 }
 
 function fakeAgent(ctx: Context, id: string): ModelAgent {
+  let chosen: unknown;
   const agent = {
     id: SessionId(id),
     session: {
@@ -88,6 +90,11 @@ function fakeAgent(ctx: Context, id: string): ModelAgent {
     },
     status: 'idle' as const,
     options: {},
+    model: {
+      current: () => chosen ?? agent.session.requestHeader?.()?.config
+        ?? (agent.options.provider && agent.options.model ? { ...agent.options } : undefined),
+      select: value => { chosen = value; },
+    },
     ctx: new Context(),
   } as ModelAgent;
   agent.ctx = createScope(ctx, agent as never).ctx;

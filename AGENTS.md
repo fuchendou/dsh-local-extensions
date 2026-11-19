@@ -8,6 +8,7 @@
 - `plugins/dsh-smart-router/package.json`：ES module 元数据和 bundle 注册入口；`cordis.patch.yml` 负责挂载插件。
 - `DEPLOY.md`：版本配套、配置、部署和排障说明。
 - `plugins/dsh-session-guard/`：渠道会话存档读取保护与 Linux sandbox 包装。
+- `plugins/dsh-superagent-isolation/`：个人后台任务的 systemd 隔离和文件交换。
 - `plugins/dsh-office-assistant/`：微信搜索、办公文件交付、待办和提醒命令。
 - `vendor/dsh-channels/`：独立 Git 源码仓库，微信会话与命令实现位于 `packages/channel-harness/`；先遵循该仓库的 `AGENTS.md`。
 - `vendor/dsh-web-search-bing/`、`vendor/dsh-office-kit/`、`vendor/dsh-todo-reminder/`：独立 Git 插件源码；办公组件先遵循其 `AGENTS.md`。
@@ -24,7 +25,7 @@ node --check plugins/dsh-smart-router/index.js
 node --test plugins/dsh-smart-router/*.test.js plugins/dsh-session-guard/*.test.js plugins/dsh-office-assistant/*.test.js
 ```
 
-第一条命令检查语法，第二条运行插件测试。按 `DEPLOY.md` 准备 Node.js ≥24.9 和 `dsh 0.2.1-rc.5`。在独立开发环境中，经确认后注册插件并启动 Web UI：
+第一条命令检查语法，第二条运行插件测试。按 `DEPLOY.md` 准备 Node.js ≥24.9 和 `dsh 0.2.2-rc.5`。在独立开发环境中，经确认后注册插件并启动 Web UI：
 
 ```bash
 dsh plugin --profile web add "link:$PWD/plugins/dsh-smart-router"
@@ -51,7 +52,7 @@ node --test plugins/dsh-smart-router/*.test.js
 
 ## 提交与 Pull Request
 
-根目录没有 `.git`，两个子仓库保留独立历史。渠道仓库采用 Conventional Commits，如 `fix(channel-harness): ...`。PR 应说明目的、行为变化、验证命令与结果，关联已有 issue；路由变更附脱敏日志，配置或版本变更同步更新 `DEPLOY.md`。
+根仓维护源码快照，独立子仓库保留自身历史。渠道仓库采用 Conventional Commits，如 `fix(channel-harness): ...`。PR 应说明目的、行为变化、验证命令与结果，关联已有 issue；路由变更附脱敏日志，配置或版本变更同步更新 `DEPLOY.md`。
 
 ## 配置、安全与操作边界
 

@@ -22,7 +22,7 @@ import pkg from '../../package.json' with { type: 'json' };
  * (AGENTS.md red line 6); test/commands-version.test.ts guards the drift
  * against this package's own `@deepseek-ai/dsh-commands` pin.
  */
-export const HARNESS_TESTED_VERSION = '0.2.1-rc.5';
+export const HARNESS_TESTED_VERSION = '0.2.2-rc.5';
 
 function renderUpdate(info: NonNullable<ChannelVersionInfo['update']>): string[] {
   const lines = [

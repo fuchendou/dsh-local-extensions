@@ -9,6 +9,7 @@ export interface ChannelAttachmentContext {
   conversationType?: 'dm' | 'group';
   threadId?: string;
   messageId: string;
+  deferExtraction?: boolean;
 }
 
 export interface ChannelAttachmentDescriptor {
@@ -59,6 +60,7 @@ export interface ChannelAttachmentProvider {
     attachmentId: string,
     sessionId: string,
   ): Promise<ResolvedChannelAttachment>;
+  readExtracted?(attachmentId: string, sessionId: string, offset: number, limit: number, signal: AbortSignal): Promise<unknown>;
   /**
    * Optional image mirror (issue #7): store the inbound image bytes under
    * the harness attachment id so `send_channel_message` can re-send them.
@@ -118,6 +120,11 @@ export function liveAttachmentProvider(
         );
       }
       return provider.resolveAttachment(attachmentId, sessionId);
+    },
+    async readExtracted(attachmentId, sessionId, offset, limit, signal) {
+      const provider = resolve();
+      if (!provider?.readExtracted) throw new Error('渠道附件文本服务不可用。');
+      return provider.readExtracted(attachmentId, sessionId, offset, limit, signal);
     },
     async storeImage(context, image) {
       return resolve()?.storeImage?.(context, image);
